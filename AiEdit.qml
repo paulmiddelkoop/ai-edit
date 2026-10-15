@@ -21,6 +21,15 @@ Item {
   property string mode: "pick"
   property var actions: []
   property var config: ({})
+  property var providers: []
+  property bool providerPickerOpen: false
+  property string pickerFocusBefore: "actions"
+  property var lastRequest: null
+  property string lastBackend: ""
+  readonly property bool canRetryWithCodex: root.mode === "error" && root.lastBackend === "agy"
+    && root.lastRequest !== null && /usage limit reached|rate limit|quota/i.test(root.errorText)
+  readonly property string providerLabel: root.config.backend === "agy" ? "Antigravity"
+    : root.config.backend === "codex" ? "Codex" : "Claude Code"
   property bool compose: true
   // Nothing to paste over: compose mode has no window, a terminal's
   // selection is only a highlight (a paste would land at the cursor), and
@@ -70,15 +79,20 @@ Item {
   property color inserted: "#a6e3a1"
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
-  property int contentMargin: Style.spacing.panelPadding
-  property int contentSpacing: Style.spacing.md
-  property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
-  property int cardWidth: Math.min(Style.space(config.width || 560), panel.width - Style.gapsOut * 2)
-  property int textMaxHeight: Math.round(panel.height * 0.4)
+  property int contentMargin: Style.spacing.popupPadding
+  property int contentSpacing: Style.spacing.lg
+  property int headerHeight: Math.max(Style.space(24), Style.font.title + Style.spacing.sm * 2)
+  property int cardWidth: Math.min(Style.space(config.width || 480), panel.width - Style.gapsOut * 2)
+  property int textMaxHeight: Math.max(Style.font.title * 2, Math.min(
+    Math.round(panel.height * 0.4), panel.height - Style.gapsOut * 2
+      - card.contentTopInset - card.contentBottomInset - root.headerHeight
+      - (actionBox.visible ? actionBox.height + root.contentSpacing : 0)
+      - (promptField.visible ? promptField.height + root.contentSpacing : 0)
+      - footer.implicitHeight - root.contentSpacing * 2))
   property color selectedBackground: Color.menu.selectedBackground
   property color selectedText: Color.menu.selectedText
   property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", Color.menu.selectedBorder, 0)
-  readonly property int actionRowHeight: Math.max(Style.space(50), Style.font.body + Style.spacing.rowPaddingX * 2)
+  readonly property int actionRowHeight: Math.max(Style.space(32), Style.font.title + Style.spacing.sm * 2)
   readonly property int actionRowPeek: Math.round(root.actionRowHeight * 0.55)
 
   function open(payloadJson) {
@@ -93,6 +107,8 @@ Item {
     root.chaining = false
     root.promptOnResult = false
     root.errorText = ""
+    root.lastRequest = null
+    root.providerPickerOpen = false
     editor.text = ""
     root.selectedIndex = 0
     root.cursorActive = true
@@ -134,13 +150,40 @@ Item {
     root.expanded = root.config.compact !== true
     var service = root.shell && typeof root.shell.serviceFor === "function" ? root.shell.serviceFor("ai-edit") : null
     if (service)
-      service.keepWarm([root.config.model].concat(root.actions.map(function(a) { return a.model })), root.config.idle_timeout)
+      service.keepWarm([root.config.model].concat(root.actions.map(function(a) { return a.model })), root.config.idle_timeout, root.config.backend)
     var session = state.session || {}
     root.compose = session.source !== "selection"
     root.copyOnly = root.compose || session.terminal === true || session.editable === "no"
     editor.text = session.text || ""
     if (root.compose) editor.forceActiveFocus()
     else keyCatcher.forceActiveFocus()
+  }
+
+  function openProviderPicker() {
+    if (root.mode === "busy") return
+    root.pickerFocusBefore = promptField.activeFocus ? "prompt" : editor.activeFocus ? "editor" : "actions"
+    root.providerPickerOpen = true
+    providerPicker.begin(root.config.backend || "agent", root.config.model)
+    if (!providersProc.running) providersProc.running = true
+  }
+
+  function closeProviderPicker() {
+    root.providerPickerOpen = false
+    if (root.pickerFocusBefore === "prompt" && root.promptOpen) promptField.forceActiveFocus()
+    else if (root.pickerFocusBefore === "editor" && root.mode === "pick") editor.forceActiveFocus()
+    else keyCatcher.forceActiveFocus()
+  }
+
+  function selectProvider(backend, model, retry) {
+    if (selectionProc.running) return
+    selectionProc.retryFailed = retry === true
+    selectionProc.command = [root.aiEditBin + "-provider", "select", backend, model]
+    selectionProc.running = true
+  }
+
+  function retryWithCodex() {
+    if (!root.canRetryWithCodex) return
+    root.selectProvider("codex", "", true)
   }
 
   function actionForKey(letter) {
@@ -194,20 +237,24 @@ Item {
     root.startRun("-", label.charAt(0).toUpperCase() + label.slice(1), instruction, root.config.model, !preview)
   }
 
-  function startRun(id, label, instruction, model, paste) {
+  function startRun(id, label, instruction, model, paste, retry) {
     if (root.mode === "busy") return
-    var chain = root.doneSteps.length > 0 && (root.mode !== "pick" || root.promptOnResult)
-    var input = chain ? root.chainInput : editor.text
+    var chain = retry ? root.lastRequest.chain : root.doneSteps.length > 0 && (root.mode !== "pick" || root.promptOnResult)
+    var input = retry ? root.lastRequest.input : chain ? root.chainInput : editor.text
     if (!input.trim()) {
       root.fail("Nothing to rewrite: type or paste some text first.")
       return
     }
     root.promptOpen = false
+    root.providerPickerOpen = false
     root.promptOnResult = false
     root.showNext = false
     root.chaining = chain
     root.steps = (chain ? root.doneSteps : []).concat([label])
     root.busyLabel = label
+    root.lastRequest = { id: id, label: label, instruction: instruction, input: input, chain: chain,
+      paste: paste, wantsResult: root.runWantsResult }
+    root.lastBackend = root.config.backend
     root.pasteWhenDone = paste
     root.mode = "busy"
     keyCatcher.forceActiveFocus()
@@ -215,7 +262,7 @@ Item {
     var run = root.runId
     var service = root.shell && typeof root.shell.serviceFor === "function" ? root.shell.serviceFor("ai-edit") : null
     if (service) {
-      service.rewrite(model || "sonnet", instruction, input, function(text) {
+      service.rewrite(model || root.config.model, instruction, input, function(text) {
         if (run !== root.runId) return
         root.stopCompares()
         var compare = compareComponent.createObject(root, { ownRun: run, input: JSON.stringify({ original: input, result: text }) })
@@ -226,11 +273,11 @@ Item {
       return
     }
     // Without the service (a shell that has not loaded it) the CLI runs a
-    // cold claude: slower, same result.
+    // cold agent: slower, same result.
     runProc.ownRun = run
     runProc.input = input
-    runProc.environment = id === "-" ? { "AI_EDIT_INSTRUCTION": instruction } : { "AI_EDIT_INSTRUCTION": null }
-    runProc.command = [root.aiEditBin, "run", id, "--diff"]
+    runProc.environment = id === "-" || retry ? { "AI_EDIT_INSTRUCTION": instruction } : { "AI_EDIT_INSTRUCTION": null }
+    runProc.command = [root.aiEditBin, "run", retry ? "-" : id, "--diff"]
     runProc.running = true
   }
 
@@ -291,14 +338,17 @@ Item {
   }
 
   function hint(message) {
+    var backend = root.mode === "error" && root.lastBackend ? root.lastBackend : root.config.backend
+    var agent = backend === "agy" ? "Antigravity" : backend === "codex" ? "Codex" : "Claude Code"
+    var command = backend === "agent" ? "claude" : backend
     if (/usage limit|rate limit|limit reached/i.test(message))
-      return "The Claude usage limit is reached. Try again later."
+      return "The " + agent + " usage limit is reached. Try again later."
     if (/not installed/i.test(message))
-      return "Install Claude Code and log in with: claude"
+      return "Install " + agent + " and log in with: " + command
     if (/log ?in|auth|credential|401/i.test(message))
-      return "Log in to Claude Code with: claude"
+      return "Log in to " + agent + " with: " + command
     if (/did not answer|exited|could not be started|still starting/i.test(message))
-      return "Check that Claude Code works: run claude in a terminal"
+      return "Check that " + agent + " works: run " + command + " in a terminal"
     return ""
   }
 
@@ -362,12 +412,13 @@ Item {
   }
 
   readonly property var hints: root.mode === "busy" ? [["Esc", "cancel"]]
+    : root.promptOpen ? [["↵", "run"], ["⇧", "skip preview"], ["Esc", "back"]]
     : root.mode === "diff" ? (root.showNext && root.cursorActive ? [["↵", "run"], ["y", "copy"]]
         : root.copyOnly ? [["↵", "copy"]] : [["↵", "paste"], ["y", "copy"]])
         .concat([["?", root.showNext ? "hide actions" : "actions"], ["⌫", "back"], ["Esc", "close"]])
-    : root.mode === "error" ? [["⌫", "back"], ["Esc", "close"]]
+    : root.mode === "error" ? (root.canRetryWithCodex ? [["↵", "retry with Codex"]] : []).concat([["⌫", "back"], ["Esc", "close"]])
     : editor.activeFocus ? [["Tab", "choose action"], ["Esc", "close"]]
-    : [["⇧", root.copyOnly ? "copy without preview" : "paste without preview"], ["Tab", "edit"], ["Esc", "close"]]
+    : [["↵", "run"], ["Tab", "edit"], ["⇧", "skip preview"], ["Esc", "close"]]
 
   function leaveEditor() {
     if (editor.text.trim()) keyCatcher.forceActiveFocus()
@@ -385,10 +436,25 @@ Item {
     var other = event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
 
     if (event.key === Qt.Key_Escape) {
+      if (root.providerPickerOpen) {
+        root.closeProviderPicker()
+        return true
+      }
       root.dismiss()
       return true
     }
-    if (root.mode === "busy") return true
+    if (root.mode === "busy" || selectionProc.running) return true
+    // A held key must not retry a failed rewrite repeatedly.
+    if (event.isAutoRepeat && root.mode === "error") return true
+    if (event.key === Qt.Key_M && (event.modifiers & Qt.ControlModifier)) {
+      root.openProviderPicker()
+      return true
+    }
+    if (root.providerPickerOpen) return true
+    if (root.canRetryWithCodex && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+      root.retryWithCodex()
+      return true
+    }
     if (other) return false
     // A held Enter would start a run and then accept its result unseen.
     if (event.isAutoRepeat && event.key !== Qt.Key_Up && event.key !== Qt.Key_Down) return true
@@ -452,6 +518,44 @@ Item {
       return true
     }
     return false
+  }
+
+  Process {
+    id: providersProc
+    command: [root.aiEditBin + "-provider", "list"]
+    stdout: StdioCollector { id: providersOut; waitForEnd: true }
+    onExited: function(code) {
+      if (code === 0) {
+        try { root.providers = JSON.parse(providersOut.text) } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: selectionProc
+    property bool retryFailed: false
+    stdout: StdioCollector { id: selectionOut; waitForEnd: true }
+    stderr: StdioCollector { id: selectionErr; waitForEnd: true }
+    onExited: function(code) {
+      if (!root.opened) return
+      if (code !== 0) {
+        if (root.providerPickerOpen) providerPicker.error = selectionErr.text.trim() || "Could not save the model choice"
+        else root.fail(selectionErr.text.trim() || "Could not switch backend")
+        return
+      }
+      var settings
+      try { settings = JSON.parse(selectionOut.text) } catch (e) { root.fail("Could not read the model choice"); return }
+      root.config = settings.config
+      root.actions = settings.actions
+      var service = root.shell && typeof root.shell.serviceFor === "function" ? root.shell.serviceFor("ai-edit") : null
+      if (service) service.keepWarm([root.config.model], root.config.idle_timeout, root.config.backend)
+      root.closeProviderPicker()
+      if (selectionProc.retryFailed && root.lastRequest) {
+        var request = root.lastRequest
+        root.runWantsResult = request.wantsResult
+        root.startRun(request.id, request.label, request.instruction, root.config.model, request.paste, true)
+      }
+    }
   }
 
   Process {
@@ -591,7 +695,7 @@ Item {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             // A long custom prompt is cut off early: the text is what matters.
-            width: Math.min(implicitWidth, parent.width * 0.6)
+            width: Math.min(implicitWidth, parent.width * 0.38)
             textFormat: Text.PlainText
             text: root.mode === "busy" ? root.busyLabel + "…"
               : root.mode === "diff" ? root.shownLabel
@@ -600,8 +704,27 @@ Item {
             color: root.foreground
             opacity: 0.58
             font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
+            font.pixelSize: Style.font.title
             elide: Text.ElideRight
+          }
+
+          Text {
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, parent.width * 0.58)
+            text: root.providerLabel + " · " + (root.config.model || "") + " ▾"
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: root.mode === "busy" ? 0.35 : 0.65
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideMiddle
+            MouseArea {
+              anchors.fill: parent
+              enabled: root.mode !== "busy"
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.openProviderPicker()
+            }
           }
 
           // While a rewrite runs, a short accent line glides under the header.
@@ -633,12 +756,38 @@ Item {
           }
         }
 
+        ProviderPicker {
+          id: providerPicker
+          visible: root.providerPickerOpen
+          width: parent.width
+          providers: root.providers
+          saving: selectionProc.running
+          foreground: root.foreground
+          accent: root.accent
+          fontFamily: root.fontFamily
+          onChosen: function(backend, model) { root.selectProvider(backend, model, false) }
+          onClosed: root.closeProviderPicker()
+        }
+
+        ActionRow {
+          visible: root.canRetryWithCodex && !root.providerPickerOpen
+          enabled: !selectionProc.running
+          width: parent.width
+          height: root.actionRowHeight
+          key: "↵"
+          label: "Retry with Codex"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onActivated: root.retryWithCodex()
+        }
+
         // The text: a quote with an accent rule. Editable in pick, the diff
         // or result afterwards, the message on an error.
         Item {
           id: textBlock
           width: parent.width
-          height: Math.min(Math.max(shown.implicitHeight, Style.font.title * 2), root.textMaxHeight)
+          visible: !root.providerPickerOpen
+          height: Math.min(Math.max(shown.implicitHeight, Style.font.title * (root.compose && editor.text === "" ? 2 : 1.5)), root.textMaxHeight)
           readonly property bool showsResult: root.mode === "diff" || (root.mode === "busy" && root.chaining)
           readonly property Item shown: showsResult ? diffText
             : root.mode === "error" ? errorColumn : editor
@@ -683,7 +832,10 @@ Item {
               Keys.onPressed: function(event) {
                 var shift = (event.modifiers & Qt.ShiftModifier) !== 0
                 var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
-                if (event.key === Qt.Key_Escape) {
+                if (ctrl && event.key === Qt.Key_M) {
+                  root.openProviderPicker()
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Escape) {
                   root.dismiss()
                   event.accepted = true
                 } else if (event.key === Qt.Key_Tab) {
@@ -759,14 +911,17 @@ Item {
 
         TextField {
           id: promptField
-          visible: root.promptOpen
+          visible: root.promptOpen && !root.providerPickerOpen
           width: parent.width
           placeholderText: "Tell AI Edit what to do with the text"
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
           Keys.priority: Keys.BeforeItem
           Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_Escape) {
+            if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_M) {
+              root.openProviderPicker()
+              event.accepted = true
+            } else if (event.key === Qt.Key_Escape) {
               root.promptOpen = false
               root.promptOnResult = false
               keyCatcher.forceActiveFocus()
@@ -795,9 +950,9 @@ Item {
           }
           // After a run the result is what matters; ? brings the actions
           // back.
-          visible: root.mode === "diff" ? root.showNext : !textBlock.showsResult && root.expanded
+          visible: !root.providerPickerOpen && !root.promptOpen && (root.mode === "diff" ? root.showNext : !textBlock.showsResult && root.expanded)
           opacity: root.mode === "busy" ? 0.3 : 1
-          enabled: root.mode !== "busy"
+          enabled: root.mode !== "busy" && !selectionProc.running
 
           Flickable {
             id: actionScroll
@@ -880,15 +1035,17 @@ Item {
         }
 
         Flow {
+          id: footer
+          visible: !root.providerPickerOpen
           width: parent.width
-          spacing: Style.spacing.huge
+          spacing: Style.spacing.xxl
 
           Repeater {
             // In the text field ? is just a character; promise only what works there.
-            model: root.expanded || (root.mode === "diff" && root.showNext) ? root.hints : editor.activeFocus ? [["Tab", "choose action"]] : [["?", "actions"]]
+            model: root.promptOpen || root.expanded || (root.mode === "diff" && root.showNext) ? root.hints : editor.activeFocus ? [["Tab", "choose action"]] : [["?", "actions"]]
             delegate: Row {
               required property var modelData
-              spacing: Style.spacing.md
+              spacing: Style.spacing.sm
 
               Text {
                 textFormat: Text.PlainText

@@ -36,7 +36,7 @@ BorderSurface {
     text: (root.key || " ") + " → " + root.label
     color: root.textColor
     font.family: root.fontFamily
-    font.pixelSize: Style.font.heading
+    font.pixelSize: Style.font.title
     font.weight: Font.Medium
     elide: Text.ElideRight
   }
@@ -52,7 +52,7 @@ BorderSurface {
     color: root.textColor
     opacity: 0.36
     font.family: root.fontFamily
-    font.pixelSize: Style.font.heading
+    font.pixelSize: Style.font.title
   }
 
   MouseArea {

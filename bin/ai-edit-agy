@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Antigravity adapter; --stream exposes Claude-compatible one-turn NDJSON."""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL = "gemini-3.8-flash-low"
+MAX_REQUEST = 4 * 1024 * 1024
+
+
+def emit(result="", error=False):
+    print(json.dumps({"type": "result", "subtype": "error" if error else "success",
+                      "is_error": error, "result": result}), flush=True)
+
+
+def sandbox(directory, model):
+    agy = shutil.which(os.environ.get("AI_EDIT_AGY", "agy"))
+    bwrap = shutil.which("bwrap")
+    if not agy:
+        raise RuntimeError("agy is not installed")
+    if not bwrap:
+        raise RuntimeError("bwrap is not installed (required for private Antigravity state)")
+    home = directory / "home"
+    work = directory / "work"
+    agent = work / ".agents/agents/ai-edit.md"
+    home.mkdir()
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: ai-edit\ndescription: Rewrite selected text\n"
+                     "tools: []\nmainAgent: true\nsubagent: false\n"
+                     "mcpServers: []\nskills: []\nplugins: []\n---\n"
+                     + (ROOT / "system-prompt.txt").read_text())
+    (home / ".gemini/antigravity-cli").mkdir(parents=True)
+    (home / ".gemini/antigravity-cli/settings.json").write_text(
+        json.dumps({"enableTelemetry": False, "toolPermission": "strict"}))
+    command = [bwrap, "--die-with-parent", "--ro-bind", "/", "/",
+               "--dev", "/dev", "--proc", "/proc", "--unshare-pid",
+               "--tmpfs", "/tmp", "--tmpfs", "/var/tmp",
+               "--tmpfs", str(Path.home()), "--bind", str(directory), str(directory)]
+    for key, value in {"HOME": home, "XDG_CONFIG_HOME": home / ".config",
+                       "XDG_DATA_HOME": home / ".local/share",
+                       "XDG_STATE_HOME": home / ".local/state",
+                       "XDG_CACHE_HOME": home / ".cache", "TMPDIR": directory}.items():
+        command += ["--setenv", key, str(value)]
+    # The executable usually lives under the home directory masked above.
+    command += ["--ro-bind", agy, str(directory / "agy"), "--chdir", str(work),
+                str(directory / "agy"), "--input-format", "stream-json",
+                "--output-format", "stream-json", "--model", model,
+                "--agent", "ai-edit", "--disable-slash-commands", "--log-file", "/dev/null"]
+    return command
+
+
+def stream(model):
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime or not Path(runtime).is_dir():
+        raise RuntimeError("XDG_RUNTIME_DIR is required for private Antigravity state")
+    with tempfile.TemporaryDirectory(prefix="ai-edit-agy-", dir=runtime) as temporary:
+        command = sandbox(Path(temporary), model)
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(sys.stdin, selectors.EVENT_READ, "request")
+                selector.register(proc.stdout, selectors.EVENT_READ, "response")
+                sent = False
+                while True:
+                    for key, _ in selector.select():
+                        if key.data == "request":
+                            line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
+                            selector.unregister(sys.stdin)
+                            if not line:
+                                return
+                            if len(line) > MAX_REQUEST:
+                                raise RuntimeError("text is too large")
+                            request = json.loads(line)
+                            content = request["message"]["content"]
+                            message = {"event": "user", "message": {"content": content}}
+                            proc.stdin.write((json.dumps(message) + "\n").encode())
+                            proc.stdin.flush()
+                            proc.stdin.close()
+                            sent = True
+                        else:
+                            line = proc.stdout.readline()
+                            if not line:
+                                raise RuntimeError("agy exited before returning a result; run agy in a terminal to check authentication")
+                            event = json.loads(line)
+                            if event.get("event") == "step_update":
+                                step = event.get("step_update", {})
+                                if step.get("step_type") == "tool":
+                                    raise RuntimeError("agy attempted a tool call instead of rewriting text")
+                            if event.get("event") != "result":
+                                continue
+                            result = event.get("result", {})
+                            if not sent:
+                                raise RuntimeError("agy returned a result before the request")
+                            if result.get("status") != "SUCCESS":
+                                # Provider diagnostics may echo the selection. Do not relay them.
+                                diagnostic = json.dumps(result)
+                                if re.search(r"rate.?limit|quota|usage.?limit|resource_exhausted|\b429\b|credits.{0,20}exhaust", diagnostic, re.I):
+                                    raise RuntimeError("Antigravity usage limit reached. Try another backend or try again later.")
+                                raise RuntimeError("agy could not complete the rewrite; run agy in a terminal to check the error")
+                            response = result.get("response")
+                            if not isinstance(response, str):
+                                raise RuntimeError("agy returned an invalid response")
+                            return response
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            proc.wait()
+
+
+def cold():
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("ai_edit_claude", str(ROOT / "bin/ai-edit-claude"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    common = importlib.util.module_from_spec(spec)
+    loader.exec_module(common)
+    worker = None
+    try:
+        raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
+        if len(raw) > MAX_REQUEST:
+            raise common.TurnError("text is too large")
+        request = common.parse_request(raw)
+        model = json.loads(raw).get("model") or DEFAULT_MODEL
+        if not isinstance(model, str):
+            raise common.TurnError("model must be a string")
+        worker = common.Worker(model, command=[str(Path(__file__).resolve()), "--stream", model],
+                               name="agy", terminate_grace=1)
+        reply = {"text": common.rewrite(worker, request)}
+    except (common.TurnError, OSError, ValueError) as error:
+        reply = {"error": str(error)}
+    finally:
+        if worker:
+            worker.stop()
+    print(json.dumps(reply), flush=True)
+    return 0 if "text" in reply else 1
+
+
+def terminated(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--stream":
+        signal.signal(signal.SIGTERM, terminated)
+        try:
+            response = stream(sys.argv[2])
+            if response is not None:
+                emit(response)
+        except RuntimeError as error:
+            emit(str(error), error=True)
+            sys.exit(1)
+        except (OSError, ValueError, KeyError, TypeError):
+            emit("agy could not complete the rewrite; check installation, authentication and model access", error=True)
+            sys.exit(1)
+    else:
+        sys.exit(cold())

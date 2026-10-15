@@ -82,14 +82,16 @@ def split_padding(text):
 class Worker:
     """One claude process that serves exactly one turn."""
 
-    def __init__(self, model):
+    def __init__(self, model, command=None, name="claude", terminate_grace=0):
+        self.name = name
+        self.terminate_grace = terminate_grace
         self.model = model
         self.events = queue.Queue()
         self.stderr = deque(maxlen=20)
         WORK_DIR.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, MAX_THINKING_TOKENS="0")
         self.proc = subprocess.Popen(
-            claude_command(model),
+            command if command is not None else claude_command(model),
             cwd=WORK_DIR, env=env, text=True, bufsize=1,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
@@ -134,7 +136,7 @@ class Worker:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TurnError(f"claude did not answer within {TURN_TIMEOUT} s")
+                    raise TurnError(f"{self.name} did not answer within {TURN_TIMEOUT} s")
                 try:
                     event = self.events.get(timeout=remaining)
                 except queue.Empty:
@@ -145,18 +147,18 @@ class Worker:
                     try:
                         self.proc.wait(timeout=max(0.1, deadline - time.monotonic()))
                     except subprocess.TimeoutExpired:
-                        raise TurnError(f"claude did not answer within {TURN_TIMEOUT} s")
-                    raise TurnError(self.failure(f"claude exited with status {self.proc.returncode}"))
+                        raise TurnError(f"{self.name} did not answer within {TURN_TIMEOUT} s")
+                    raise TurnError(self.failure(f"{self.name} exited with status {self.proc.returncode}"))
                 if event["type"] == "write_failed":
-                    raise TurnError(self.failure("claude exited before the request"))
+                    raise TurnError(self.failure(f"{self.name} exited before the request"))
                 if event["type"] != "result":
                     continue
                 result = event.get("result") or ""
                 if event.get("is_error") or event.get("subtype") != "success":
-                    raise TurnError(result or event.get("subtype") or "claude reported an error")
+                    raise TurnError(result or event.get("subtype") or f"{self.name} reported an error")
                 answer = extract_answer(result)
                 if not answer.strip():
-                    raise TurnError("claude returned nothing")
+                    raise TurnError(f"{self.name} returned nothing")
                 return answer
         except BaseException:
             self.kill()
@@ -173,6 +175,12 @@ class Worker:
             self.kill()
 
     def kill(self):
+        if self.terminate_grace and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+                self.proc.wait(timeout=self.terminate_grace)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
         if self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)

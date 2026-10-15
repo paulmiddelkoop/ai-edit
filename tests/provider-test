@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Selections survive reopen without modifying TOML or sending text anywhere."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+with tempfile.TemporaryDirectory(prefix="ai-edit-provider-test-", dir=os.environ["XDG_RUNTIME_DIR"]) as temporary:
+    directory = Path(temporary)
+    config = directory / "ai-edit"
+    config.mkdir()
+    path = config / "config.toml"
+    original = '# Keep my comments\nbackend = "agy"\nmodel = "gemini-3.8-flash-low"\n'
+    path.write_text(original)
+    env = dict(os.environ, XDG_CONFIG_HOME=str(directory))
+
+    def select(backend, model):
+        return json.loads(subprocess.check_output([str(ROOT / "bin/ai-edit-provider"), "select", backend, model], env=env))
+
+    def settings():
+        return json.loads(subprocess.check_output([str(ROOT / "bin/ai-edit-config")], env=env))
+
+    result = select("codex", "gpt-6.1-sol")
+    assert result["config"]["backend"] == "codex"
+    assert all(action["model"] == "gpt-6.1-sol" for action in result["actions"])
+    assert settings()["config"]["backend"] == "codex"
+    assert select("codex", "")["config"]["model"] == "gpt-6.1-sol"
+    select("agy", "claude-sonnet-4-6")
+    remembered = json.loads((config / "provider.json").read_text())
+    assert remembered["models"] == {"codex": "gpt-6.1-sol", "agy": "claude-sonnet-4-6"}
+    assert path.read_text() == original
+    path.write_text('backend = "claude"\nmodel = "haiku"\n')
+    assert settings()["config"]["backend"] == "claude"
+    assert settings()["config"]["model"] == "haiku"
+    (config / "provider.json").write_text('{"base": ["claude", "haiku"], "backend": []}')
+    assert settings()["config"]["backend"] == "claude"
+    print("ok   Provider choice persistence, model inheritance, per-backend memory and TOML overrides")

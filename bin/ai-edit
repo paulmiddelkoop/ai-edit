@@ -422,7 +422,11 @@ run() {
     [[ -n $action ]] || die "unknown action '$id'"
   fi
   backend=$(jq -r .config.backend <<<"$all")
-  [[ $backend == agent ]] || die "unknown backend '$backend'"
+  case $backend in
+    agent|claude) backend=claude ;;
+    agy|codex) ;;
+    *) die "unknown backend '$backend'" ;;
+  esac
 
   # The text and the instruction travel in files and pipes only: as an
   # argument they would show in /proc to every process on the machine, and
@@ -441,7 +445,7 @@ run() {
   reply=$(mktemp "$STATE_DIR/reply.XXXXXX") || die "cannot write to $STATE_DIR"
   printf '%s' "$action" |
     jq -c --rawfile text "$ORIGINAL" '{model, instruction, text: $text}' |
-    "$PLUGIN_DIR/bin/ai-edit-claude" >"$reply"
+    "$PLUGIN_DIR/bin/ai-edit-$backend" >"$reply"
 
   if ! jq -e 'has("text")' "$reply" >/dev/null 2>&1; then
     local error
@@ -713,7 +717,7 @@ TOML
     actions | jq -e 'map({id, key, instruction, model, preview}) == [
       {"id": "make-it-shorter", "key": "a", "instruction": "x", "model": "haiku", "preview": false},
       {"id": "b", "key": "b", "instruction": "y", "model": "opus", "preview": true}]' >/dev/null &&
-      config | jq -e '.backend == "agent" and .width == 560 and .model == "haiku" and .idle_timeout == 0' >/dev/null
+      config | jq -e '.backend == "agent" and .width == 480 and .model == "haiku" and .idle_timeout == 0' >/dev/null
   )
   check "your config overrides settings and replaces actions" configured
   broken_config() (

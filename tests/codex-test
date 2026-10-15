@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Test Codex isolation, protocol errors, authentication refresh and dispatch."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+with tempfile.TemporaryDirectory(prefix="ai-edit-codex-test-", dir=os.environ["XDG_RUNTIME_DIR"]) as temporary:
+    directory = Path(temporary)
+    runtime = directory / "runtime"
+    runtime.mkdir()
+    home = directory / "codex"
+    home.mkdir()
+    (home / "auth.json").write_text('{"synthetic": true}')
+    (home / "AGENTS.md").write_text("Do not load these personal instructions")
+    (home / "models_cache.json").write_text(json.dumps({"models": [{"slug": "gpt-6.1-sol"}]}))
+    config = directory / "config/ai-edit"
+    config.mkdir(parents=True)
+    (config / "config.toml").write_text('backend = "codex"\n')
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), CODEX_HOME=str(home), XDG_CONFIG_HOME=str(config.parent),
+               XDG_STATE_HOME=str(directory / "state"), AI_EDIT_CODEX=str(ROOT / "tests/fake-codex"), AI_EDIT_TURN_TIMEOUT="2")
+
+    def ask(instruction, text="hello", **extra):
+        request = dict(instruction=instruction, text=text, **extra)
+        result = subprocess.run([str(ROOT / "bin/ai-edit-codex")], input=json.dumps(request),
+                                text=True, capture_output=True, env=env, timeout=10)
+        assert not result.stderr, result.stderr
+        assert not [p for p in runtime.glob("ai-edit-codex-*") if p.is_dir()], "state left behind"
+        return result.returncode, json.loads(result.stdout)
+
+    assert ask("echo") == (0, {"text": "HELLO"})
+    assert ask("echo", "\n  héllo\n") == (0, {"text": "\n  HÉLLO\n"})
+    assert ask("echo", "  ") == (1, {"error": "nothing to rewrite"})
+    assert ask("empty") == (1, {"error": "codex returned nothing"})
+    for instruction in ("hang", "die", "tool", "approval", "fail", "reject"):
+        code, reply = ask(instruction)
+        assert code == 1 and "error" in reply, (instruction, reply)
+        assert "private request" not in reply["error"]
+    env["FAKE_CODEX_CONTEXT"] = "1"
+    assert ask("echo")[0] == 1
+    env["FAKE_CODEX_CONTEXT"] = "empty"
+    assert ask("echo")[0] == 1
+    del env["FAKE_CODEX_CONTEXT"]
+    assert ask("refresh") == (0, {"text": "HELLO"})
+    assert json.loads((home / "auth.json").read_text())["refreshed"]
+    assert (home / "AGENTS.md").read_text() == "Do not load these personal instructions"
+    result = subprocess.run([str(ROOT / "bin/ai-edit"), "run", "-"], input="hello",
+                            text=True, capture_output=True, timeout=10, env=dict(env, AI_EDIT_INSTRUCTION="echo"))
+    assert result.returncode == 0 and result.stdout == "HELLO", result.stderr
+    shims = directory / "mise/shims"
+    shims.mkdir(parents=True)
+    (shims / "codex").symlink_to("/usr/bin/true")
+    binaries = directory / "bin"
+    binaries.mkdir()
+    resolver = binaries / "mise"
+    resolver.write_text('#!/usr/bin/env python3\nprint(' + repr(str(ROOT / "tests/fake-codex")) + ')\n')
+    resolver.chmod(0o700)
+    env["AI_EDIT_CODEX"] = str(shims / "codex")
+    env["PATH"] = str(binaries) + os.pathsep + env["PATH"]
+    assert ask("echo") == (0, {"text": "HELLO"})
+    print("ok   Codex answers, padding, isolation, errors, timeout, refresh, cleanup and CLI dispatch")

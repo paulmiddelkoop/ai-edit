@@ -2,11 +2,12 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Keeps a claude process waiting per model inside omarchy-shell, so a rewrite
+// Keeps an agent process waiting per model inside omarchy-shell, so a rewrite
 // costs only the API time. Each process answers one turn and is replaced at
 // once, so no conversation builds up. The overlay calls rewrite().
 //
-// bin/ai-edit-claude speaks the same protocol for `ai-edit run`: keep
+// bin/ai-edit-agy --stream translates this protocol for Antigravity.
+// bin/ai-edit-claude speaks it for `ai-edit run`: keep
 // userMessage, extractAnswer and the padding in step with it.
 Item {
   id: root
@@ -24,6 +25,7 @@ Item {
   // races the engine's teardown.
   property bool closing: false
   Component.onDestruction: root.closing = true
+  property string backend: "agent"
   property var models: []
   // Minutes without use after which the waiting processes are stopped to
   // free their memory; 0 keeps them. A busy process is never in idle.
@@ -54,7 +56,7 @@ Item {
     root.lastUse = Date.now()
     var worker = root.take(model)
     if (!worker) {
-      fail("claude could not be started")
+      fail(root.backend + " could not be started")
       return
     }
     worker.turn(root.userMessage(instruction, core), {
@@ -68,7 +70,12 @@ Item {
   // The models the actions use; the overlay passes them when it opens, so a
   // model added to the config is warm from the next rewrite on. Opening counts
   // as use: a process stopped for idleness starts while a letter is chosen.
-  function keepWarm(list, idleTimeout) {
+  function keepWarm(list, idleTimeout, backend) {
+    var selected = backend || "agent"
+    if (selected !== root.backend) {
+      root.sleep()
+      root.backend = selected
+    }
     if (typeof idleTimeout === "number" && idleTimeout >= 0) root.idleTimeout = idleTimeout
     root.lastUse = Date.now()
     var unique = []
@@ -110,7 +117,7 @@ Item {
 
   function spawn(model) {
     if (root.closing) return null
-    return workerComponent.createObject(root, { model: model })
+    return workerComponent.createObject(root, { model: model, backend: root.backend })
   }
 
   function warm(model) {
@@ -160,6 +167,8 @@ Item {
       id: proc
 
       property string model: ""
+      property string backend: "agent"
+      readonly property string agentName: backend === "agent" ? "claude" : backend
       property real bornAt: Date.now()
       property bool busy: false
       property var request: null
@@ -188,10 +197,10 @@ Item {
         if (!event || event.type !== "result") return
         var result = event.result || ""
         if (event.is_error || event.subtype !== "success") {
-          proc.settle(result || event.subtype || "claude reported an error")
+          proc.settle(result || event.subtype || proc.agentName + " reported an error")
         } else {
           var answer = root.extractAnswer(result)
-          if (!answer.trim()) proc.settle("claude returned nothing")
+          if (!answer.trim()) proc.settle(proc.agentName + " returned nothing")
           else proc.settle("", answer)
         }
         // Its replacement is already waiting.
@@ -219,12 +228,13 @@ Item {
       property Timer timer: Timer {
         interval: root.turnTimeout
         onTriggered: {
-          proc.settle("claude did not answer within " + Math.round(root.turnTimeout / 1000) + " s")
+          proc.settle(proc.agentName + " did not answer within " + Math.round(root.turnTimeout / 1000) + " s")
           proc.stop(true)
         }
       }
 
-      command: ["claude", "-p",
+      command: proc.backend === "agy" || proc.backend === "codex"
+        ? [root.pluginDir + "/bin/ai-edit-" + proc.backend, "--stream", proc.model] : ["claude", "-p",
         "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--no-session-persistence",
         "--restricted", "--tools", "",
@@ -251,7 +261,7 @@ Item {
 
       onExited: function(code) {
         proc.killTimer.stop()
-        proc.settle(proc.stderrLines.join(" ") || "claude exited with status " + code)
+        proc.settle(proc.stderrLines.join(" ") || proc.agentName + " exited with status " + code)
         root.forget(proc)
         Qt.callLater(proc.destroy)
       }
@@ -294,16 +304,17 @@ Item {
     command: [root.pluginDir + "/bin/ai-edit-config"]
     stdout: StdioCollector { id: configOut; waitForEnd: true }
     onExited: function(code) {
+      var settings = null
       var list = ["sonnet"]
       var idleTimeout
       if (code === 0) {
         try {
-          var settings = JSON.parse(configOut.text)
+          settings = JSON.parse(configOut.text)
           list = [settings.config.model].concat(settings.actions.map(function(a) { return a.model }))
           idleTimeout = settings.config.idle_timeout
         } catch (e) {}
       }
-      root.keepWarm(list, idleTimeout)
+      root.keepWarm(list, idleTimeout, settings ? settings.config.backend : "agent")
     }
   }
 }

@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Exercise the real sandbox and adapter without making provider requests."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+with tempfile.TemporaryDirectory(prefix="ai-edit-agy-test-", dir=os.environ["XDG_RUNTIME_DIR"]) as temporary:
+    directory = Path(temporary)
+    runtime = directory / "runtime"
+    runtime.mkdir()
+    config = directory / "config/ai-edit"
+    config.mkdir(parents=True)
+    (config / "config.toml").write_text('backend = "agy"\n')
+    env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), XDG_CONFIG_HOME=str(config.parent),
+               XDG_STATE_HOME=str(directory / "state"), AI_EDIT_AGY=str(ROOT / "tests/fake-agy"),
+               AI_EDIT_TURN_TIMEOUT="2")
+
+    def ask(instruction, text="hello", **values):
+        request = dict(instruction=instruction, text=text, **values)
+        result = subprocess.run([str(ROOT / "bin/ai-edit-agy")], input=json.dumps(request),
+                                text=True, capture_output=True, env=env, timeout=8)
+        assert not result.stderr, result.stderr
+        assert not list(runtime.glob("ai-edit-agy-*")), "Antigravity state was not removed"
+        return result.returncode, json.loads(result.stdout)
+
+    assert ask("echo") == (0, {"text": "HELLO"})
+    assert ask("echo", "\n  héllo\n") == (0, {"text": "\n  HÉLLO\n"})
+    assert ask("echo", "  ") == (1, {"error": "nothing to rewrite"})
+    assert ask("empty") == (1, {"error": "agy returned nothing"})
+    assert ask("quota") == (1, {"error": "Antigravity usage limit reached. Try another backend or try again later."})
+    for instruction in ("hang", "die", "invalid", "tool", "fail"):
+        code, reply = ask(instruction)
+        assert code == 1 and "error" in reply, (instruction, reply)
+        assert "private selection" not in reply["error"]
+        if instruction == "hang":
+            assert reply["error"] == "agy did not answer within 2 s"
+    assert ask("echo", model=42) == (1, {"error": "model must be a string"})
+    result = subprocess.run([str(ROOT / "bin/ai-edit"), "run", "-"], input="hello",
+                            text=True, capture_output=True, timeout=8,
+                            env=dict(env, AI_EDIT_INSTRUCTION="echo"))
+    assert result.returncode == 0 and result.stdout == "HELLO", result.stderr
+    settings = subprocess.check_output([str(ROOT / "bin/ai-edit-config")], env=env, text=True)
+    assert json.loads(settings)["config"]["model"] == "gemini-3.8-flash-low"
+    (config / "config.toml").write_text('backend = "agy"\nmodel = "custom-model"\n')
+    settings = json.loads(subprocess.check_output([str(ROOT / "bin/ai-edit-config")], env=env, text=True))
+    assert settings["config"]["model"] == "custom-model"
+    assert all(action["model"] == "custom-model" for action in settings["actions"])
+    env["AI_EDIT_AGY"] = "ai-edit-nonexistent-agy"
+    assert ask("echo") == (1, {"error": "agy is not installed"})
+    print("ok   Antigravity answers, padding, failures, timeout, sandbox cleanup and CLI dispatch")

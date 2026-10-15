@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Synthetic Antigravity stream, run inside the adapter's real sandbox."""
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+assert "--disable-slash-commands" in sys.argv
+assert sys.argv[sys.argv.index("--agent") + 1] == "ai-edit"
+assert "tools: []" in Path(".agents/agents/ai-edit.md").read_text()
+assert str(Path.home()).startswith(os.environ["XDG_RUNTIME_DIR"] + "/ai-edit-agy-")
+Path.home().joinpath("saved-conversation").write_text("synthetic state")
+
+for line in sys.stdin:
+    request = json.loads(line)
+    assert request["event"] == "user"
+    content = request["message"]["content"][0]["text"]
+    instruction, _, text = content.partition("\n\n")
+    text = text.removeprefix("<text>\n").removesuffix("\n</text>")
+    if instruction == "hang":
+        time.sleep(3600)
+    if instruction == "die":
+        sys.exit(3)
+    if instruction == "invalid":
+        print("not JSON", flush=True)
+        sys.exit(0)
+    if instruction == "tool":
+        print(json.dumps({"event": "step_update", "step_update": {"step_type": "tool"}}), flush=True)
+        time.sleep(3600)
+    result = {"status": "SUCCESS", "response": f"<rewrite>{text.upper()}</rewrite>"}
+    if instruction == "empty":
+        result["response"] = ""
+    if instruction == "fail":
+        result.update(status="ERROR", response="private selection echoed in diagnostic")
+    if instruction == "quota":
+        result.update(status="ERROR", response="private selection echoed in diagnostic", error={"code": "RESOURCE_EXHAUSTED"})
+    print(json.dumps({"event": "init", "init": {"tools": []}}), flush=True)
+    print(json.dumps({"event": "result", "result": result}), flush=True)

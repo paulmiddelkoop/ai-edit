@@ -337,7 +337,7 @@ old-fashioned.
 model = "sonnet"
 preview = true
 compact = false
-width = 560
+width = 480
 idle_timeout = 30
 
 [[action]]
@@ -384,7 +384,7 @@ One window, four states:
 - **error**: the message and the hint (service not running, limit reached).
 
 The action list is one column that looks like Omarchy's keybindings menu
-(Super+K), with the menu's fonts, sizes and margins: "f → Fix" in one colour
+(Super+K), with the menu's font and selection treatment: "f → Fix" in one colour
 (a dimmed letter looked nicer but not the same), a dimmed `↵` where the menu
 puts its `›`, for actions without preview, and the menu's selection bar, moved by the arrow keys and the pointer; Enter (or →) runs the
 selected action, Shift inverts its preview. On a result the bar stays off
@@ -428,9 +428,93 @@ closes only that field. The overlay sends the text it shows to `ai-edit run
 <id> --diff` on stdin, so an edit in the field is what gets rewritten; a free
 prompt runs as `ai-edit run -` with the instruction in `AI_EDIT_INSTRUCTION`.
 
+The October 15 density pass reduces the default width from 560 to 480 and
+uses 32-pixel action rows with the theme's title-size text, 14-pixel popup
+padding and a 24-pixel header (all follow Omarchy's spacing/font scale).
+The preview keeps its reading size; short selections take only the space
+they need, while long ones scroll within the remaining screen height.
+The custom prompt hides the action list while typing, and the model picker
+replaces the editor and footer until dismissed. Both preserve the current
+text and focus. Keyboard hints use a tighter single-line layout where they
+fit. Theme colors, menu font, border, rounding and selection bar still come
+from the shell; the smaller footprint does not require `compact = true`.
+
 The diff is computed by `bin/ai-edit diff` (Python `difflib` on words with
 whitespace tokens kept) and written as `diff.json`, a list of
 `{"op": "equal|del|ins", "text": ...}` segments the QML renders.
+
+## Antigravity backend (October 14, 2026)
+
+`backend = "agy"` selects `bin/ai-edit-agy`, tested against the installed
+Antigravity CLI 1.3.5. The default model is `gemini-3.8-flash-low` when the
+user does not specify one. Claude remains the shipped default (`agent`,
+also accepted as `claude`). Both the shell's warm pool and terminal path
+honour the selection; the pool retires idle workers when the backend changes.
+
+The adapter's `--stream <model>` mode translates the existing Claude-shaped
+user event to Antigravity's `event: user`, and maps `result.status` and
+`result.response` back to the pool's existing result protocol. One process
+serves one rewrite. The cold path reuses the existing timeout, padding and
+tag-extraction code. Antigravity diagnostics are discarded rather than
+displayed because they may echo selected text.
+
+Antigravity persists conversations by default and has no documented
+no-persistence flag in this version. Each worker therefore runs inside
+bubblewrap with a temporary home and workspace under XDG_RUNTIME_DIR, the
+real home hidden and the rest of the filesystem read-only. A custom agent
+contains system-prompt.txt with an empty tool list, no MCP, skills or plugins.
+Slash-command expansion and telemetry are disabled, and logs go to /dev/null.
+The local credential service remains accessible, and existing sign-in worked
+in synthetic correction tests. All temporary state is removed before a
+successful result is returned. TERM also cleans up; forced kills may leave
+runtime-only state until the runtime directory is cleared. Authentication
+and model availability may differ on other installations; there is no fallback
+to persistent storage. `tests/agy-test` exercises the actual sandbox with a
+fake CLI and makes no model requests.
+
+## Backend selection and Codex (October 14, 2026)
+
+The header opens a backend/model picker, also available with Ctrl+M. Choices
+come from `agy models`, Codex's cached catalog and Claude's model aliases;
+custom IDs can be entered. Selection is stored atomically in provider.json
+next to the user's TOML, with a remembered model per backend. Its base tracks
+the TOML backend/model so an explicit configuration change supersedes it.
+An overlay selection applies to all actions to avoid carrying provider-specific
+action models to another backend. The active overlay keeps text, prompt and
+history while its config and action models change. Only selected models are
+kept warm.
+
+Codex uses the existing one-turn stream protocol through `bin/ai-edit-codex`.
+It resolves mise wrappers and shims before hiding the real home. Each worker
+has a private runtime home, a reduced model catalog and disabled agent tools,
+skills, plugins and personal instructions, using the benchmark's overrides.
+A synthetic prompt-input check runs before accepting text; unexpected context
+or unsupported flags stop the worker. It initializes app-server and creates
+an ephemeral thread for its single rewrite, rejecting provider model fallback,
+tool requests and unsuccessful turns. The default is gpt-6.1-sol, low effort,
+standard service tier. Tested with CLI 0.162.1.
+
+File-based authentication is copied into the runtime home. Changes made by
+Codex's normal refresh flow are copied back atomically, after comparing the
+original to avoid overwriting a newer login. AI Edit refresh saves are
+serialized by a runtime lock; other Codex clients do not share that lock.
+No token or selected text is emitted in diagnostics. Runtime state is removed
+before the successful result; forced kills can leave runtime-only state until
+logout. Keyring-only login is not yet supported by this adapter.
+
+Antigravity result errors are classified in memory and reported as a fixed
+usage-limit message when appropriate; provider diagnostics are never relayed.
+That error offers Retry with Codex. The overlay retains the exact input,
+instruction, chain position and preview preference, switches backend explicitly,
+then retries. It does not infer the failed input from editor or clipboard state.
+There is no automatic cross-provider fallback.
+
+Fake CLI tests exercise both protocols, context rejection, refresh persistence,
+timeout and cleanup, quota classification and saved provider choices without
+model requests. Synthetic live overlay checks cover picker persistence and
+Codex rewrites in English, Spanish and French. A live quota stand-in also
+verified retry to Codex with the original source and a custom substitution
+instruction; no real account quota was consumed to trigger the error.
 
 ## Open points
 

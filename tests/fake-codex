@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Synthetic Codex context probe and app-server for adapter tests."""
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+home = Path(os.environ["CODEX_HOME"])
+assert home.is_relative_to(Path(os.environ["XDG_RUNTIME_DIR"]))
+assert not (home / "AGENTS.md").exists()
+if sys.argv[1:3] == ["debug", "prompt-input"]:
+    if os.environ.get("FAKE_CODEX_CONTEXT") == "empty":
+        print("[]")
+    elif os.environ.get("FAKE_CODEX_CONTEXT"):
+        print(json.dumps([{"role": "developer", "content": [{"text": "Unexpected coding instructions"}]}]))
+    else:
+        print(json.dumps([{"role": "user", "content": [{"text": "AI Edit context check."}]}]))
+    sys.exit(0)
+
+assert sys.argv[1] == "app-server"
+instruction = ""
+
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+
+for line in sys.stdin:
+    event = json.loads(line)
+    method = event["method"]
+    seq = event.get("id")
+    params = event.get("params", {})
+    if method == "initialize":
+        send({"id": seq, "result": {}})
+    elif method == "thread/start":
+        assert params["ephemeral"] and params["sandbox"] == "read-only"
+        assert params["dynamicTools"] == []
+        assert "Preserve the language" in params["baseInstructions"]
+        send({"id": seq, "result": {"thread": {"id": "synthetic"}, "model": params["model"]}})
+    elif method == "turn/start":
+        content = params["input"][0]["text"]
+        instruction, _, text = content.partition("\n\n")
+        text = text.removeprefix("<text>\n").removesuffix("\n</text>")
+        if instruction == "die":
+            sys.exit(3)
+        if instruction == "hang":
+            time.sleep(3600)
+        if instruction == "reject":
+            send({"id": seq, "error": {"message": "private request text"}})
+            continue
+        send({"id": seq, "result": {"turn": {"id": "synthetic-turn"}}})
+        if instruction == "approval":
+            send({"id": 999, "method": "item/commandExecution/requestApproval", "params": {}})
+            continue
+        if instruction == "refresh":
+            auth = json.loads((home / "auth.json").read_text())
+            auth["refreshed"] = True
+            (home / "auth.json").write_text(json.dumps(auth))
+        item = {"type": "agentMessage", "text": "" if instruction == "empty" else f"<rewrite>{text.upper()}</rewrite>"}
+        if instruction == "tool":
+            item = {"type": "commandExecution"}
+        send({"method": "item/completed", "params": {"threadId": "synthetic", "item": item}})
+        send({"method": "turn/completed", "params": {"threadId": "synthetic", "turn": {
+            "status": "failed" if instruction == "fail" else "completed", "error": {"message": "private request text"}}}})

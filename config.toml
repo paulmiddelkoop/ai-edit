@@ -2,16 +2,20 @@
 # copy it to ~/.config/ai-edit/config.toml and edit the copy. Settings you
 # leave out keep these values. Actions you list replace these as a whole.
 
-# Claude model for actions that do not name one: sonnet, haiku or opus.
+# Backend: agent (Claude Code), claude, agy (Antigravity CLI), or codex.
+backend = "agent"
+# Model for actions that do not name one. For agy use a model from `agy models`,
+# e.g. gemini-3.8-flash-low. If model is omitted in your agy config, that is
+# the default; Codex defaults to gpt-6.1-sol and Claude to sonnet.
 model = "sonnet"
 # Show the result before pasting it; Shift with the letter does the opposite.
 preview = true
 # Show only the text; the letters keep working and ? shows the actions.
 compact = false
 # Width of the overlay.
-width = 560
-# Minutes without using AI Edit after which the Claude process kept ready is
-# stopped to free its memory (about 170 MB per model). The next rewrite then
+width = 480
+# Minutes without using AI Edit after which the agent process kept ready is
+# stopped to free its memory (about 170 MB per Claude model). The next rewrite then
 # takes a few seconds longer. 0 keeps it ready all the time.
 idle_timeout = 30
 

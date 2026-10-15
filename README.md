@@ -9,6 +9,10 @@ shows what changed; **Enter** puts the result back.
 An [Omarchy](https://omarchy.org) plugin for the moments when you know what you
 want to say and just want a hand saying it.
 
+This fork of [paulmiddelkoop/ai-edit](https://github.com/paulmiddelkoop/ai-edit)
+adds Antigravity and Codex backends, a backend/model picker, and manual retry
+with Codex when Antigravity reaches a usage limit.
+
 ![Fixing typos in a Gmail message: select the text, press Super+E and F, review the red and green changes, press Enter to paste the corrected text](docs/demo/fix.gif)
 
 - **Stay in your app.** Edit the text you're already writing, without opening
@@ -19,19 +23,20 @@ want to say and just want a hand saying it.
   changes before accepting them, or skip the preview when you want to.
 - **Feels like part of Omarchy.** Matches your theme and uses familiar
   keyboard controls. Press an action's letter, or use the arrow keys and Enter.
-- **Fast.** Short rewrites typically take about one to two seconds.
-- **Uses your Claude Code subscription.** No separate API key needed.
-  Currently supports Claude Code only.
+- **Fast.** Short rewrites typically take a few seconds, depending on the
+  backend and model.
+- **Uses your coding agent account.** Claude Code by default, or Antigravity
+  CLI or Codex. No separate API key needed.
 
 ## Install
 
-You'll need **Omarchy 4.0 or newer** and **Claude Code logged in**.
-Run `claude` once if you haven't signed in yet.
+You'll need **Omarchy 4.0 or newer** and **Claude Code, Antigravity CLI or Codex logged in**.
+Run `claude`, `agy` or `codex login` if you haven't signed in yet.
 
 Install the plugin:
 
 ```bash
-omarchy plugin add https://github.com/paulmiddelkoop/ai-edit --enable
+omarchy plugin add https://github.com/jeancarlosg93/ai-edit --enable
 ```
 
 Add this shortcut to `~/.config/hypr/bindings.lua`:
@@ -117,11 +122,82 @@ open AI Edit.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `model` | `"sonnet"` | Claude model for actions that don't name one: `sonnet`, `haiku` or `opus`. |
+| `backend` | `"agent"` | `agent` or `claude` uses Claude Code; `agy` uses Antigravity CLI; `codex` uses Codex. |
+| `model` | `"sonnet"` | Model for actions that don't name one. When omitted from your config, `agy` defaults to `gemini-3.8-flash-low` and `codex` to `gpt-6.1-sol`. |
 | `preview` | `true` | Show the result before pasting it. Shift with the letter does the opposite. |
 | `compact` | `false` | Hide the action list and key hints; the letters keep working and **?** shows them. |
-| `width` | `560` | Width of the overlay. |
-| `idle_timeout` | `30` | Minutes without a rewrite before the waiting Claude process stops to free its memory (about 170 MB per model). The next rewrite then takes a few seconds longer. `0` keeps Claude ready all the time. |
+| `width` | `480` | Width of the overlay. |
+| `idle_timeout` | `30` | Minutes without a rewrite before the waiting agent stops to free its memory (about 170 MB per Claude model). The next rewrite then takes longer. `0` keeps the agent ready all the time. |
+
+### Switch backend or model
+
+Click the backend and model in the overlay's header, or press **Ctrl+M**.
+Choose Antigravity, Codex or Claude Code, then click a model. You can also
+type a model ID and press Enter; **Ctrl+Left/Right** changes the backend in
+that field. Switching keeps your text, custom instruction and existing
+preview. Catalog entries are choices, not a guarantee of account access.
+
+AI Edit remembers the selection and the last model used with each backend in
+`~/.config/ai-edit/provider.json`. The selected model applies to all actions.
+It does not rewrite your TOML. Changing `backend` or `model` in the TOML
+overrides the saved selection; deleting `provider.json` restores the TOML
+defaults, including any action-specific models.
+
+When Antigravity reports a usage limit, **Retry with Codex** (or Enter)
+switches to your remembered Codex model and retries the exact failed text
+and instruction. It keeps the action's preview preference. Switching is
+manual; AI Edit does not send the text to another provider automatically.
+
+### Codex
+
+Requires `codex`, `bubblewrap` (`bwrap`), file-based Codex authentication and
+a cached model catalog. Tested with Codex CLI 0.162.1. Sign in using
+`codex login` and start Codex once to populate its catalog, then choose it in
+the overlay or set:
+
+```toml
+backend = "codex"
+model = "gpt-6.1-sol"
+```
+
+Each worker initializes an app-server, validates context isolation with
+synthetic input, then handles one rewrite in a fresh ephemeral thread.
+Personal instructions, skills, plugins and coding tools are excluded. The
+adapter refuses to proceed if its context check fails after a CLI upgrade.
+Codex state stays in a private runtime home and is removed when the worker
+exits. Refreshed credentials are saved back to the original authentication
+file if another client has not changed it. Provider diagnostics are discarded
+because they may contain selected text.
+
+### Antigravity CLI
+
+Requires `agy` with streaming input support (tested with 1.3.5) and
+`bubblewrap` (`bwrap`). Sign in with `agy`, then set
+`~/.config/ai-edit/config.toml` to:
+
+```toml
+backend = "agy"
+model = "gemini-3.8-flash-low"
+```
+
+Use `agy models` to list models available to your account. If you copied the
+whole default config, replace its `model = "sonnet"` line too. Actions with
+their own model must also use an Antigravity model ID.
+
+Each rewrite uses a fresh custom writing agent configured with an empty tool
+list. Its home, workspace and conversation storage are isolated under
+`$XDG_RUNTIME_DIR` and removed when the worker exits. The real home directory
+is hidden, the rest of the filesystem is read-only, and provider logs are
+discarded. Existing system credential access is retained; this was verified
+with the installed CLI's existing sign-in. If authentication fails in the
+isolated environment, the adapter reports an error rather than running with
+ordinary persistent storage.
+
+Fix, Improve and Shorten preserve the source language, including English,
+Spanish, French and mixed-language passages. The **English** action explicitly
+translates; a custom prompt can also request translation. Very short or
+ambiguous text can still be misinterpreted by a model, so keep the preview on
+when the language matters.
 
 ### Your own actions
 
@@ -149,9 +225,11 @@ the shipped one as a whole, so keep the ones you want from the copied config.
 
 ## What happens to your text
 
-AI Edit sends the text you choose to Claude through Claude Code, using your
-existing account and its usage limits. Each rewrite starts fresh, with no
-conversation history, tools or MCP servers, and no saved Claude Code session.
+AI Edit sends the text you choose through your selected coding agent, using
+your existing account and its usage limits. Each rewrite starts fresh.
+Claude Code runs without tools, MCP servers or saved sessions; Antigravity
+and Codex use the isolated workers described above. Your provider's data
+policies still apply.
 
 Locally, text stays in your private runtime directory, never in command-line
 arguments or AI Edit logs. AI Edit restores the clipboard after capturing
@@ -162,10 +240,9 @@ clipboard.
 ## Under the hood
 
 A small shell script handles selection and paste, a service inside the
-Omarchy shell keeps Claude ready (about 170 MB, nearly all of it Claude Code
-itself, stopped after 30 minutes without use), and a QML overlay shows the
-result. From a terminal, `ai-edit run` starts Claude fresh, which takes a
-second longer.
+Omarchy shell keeps the selected agent ready (stopped after 30 minutes
+without use), and a QML overlay shows the result. From a terminal,
+`ai-edit run` starts the agent fresh.
 
 See the [design notes](docs/design.md) for the architecture and measurements.
 To run the tests without a compositor or Claude requests:
@@ -173,12 +250,15 @@ To run the tests without a compositor or Claude requests:
 ```bash
 bin/ai-edit selftest
 tests/claude-test
+tests/agy-test
+tests/codex-test
+tests/provider-test
 ```
 
 ## Roadmap
 
-- **More coding agents.** Codex and the other agents Omarchy can set up, not
-  only Claude Code, following the agent you already use.
+- **More coding agents.** Support additional agents Omarchy can set up,
+  following the agent you already use.
 - **An action on its own key**, such as Super+Shift+F to fix the selection
   without opening the list first.
 

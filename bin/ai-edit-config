@@ -17,6 +17,7 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ai-edit"
 SETTINGS = ("model", "preview", "compact", "width", "backend", "idle_timeout")
+DEFAULT_MODELS = {"agent": "sonnet", "claude": "sonnet", "agy": "gemini-3.8-flash-low", "codex": "gpt-6.1-sol"}
 
 
 class ConfigError(Exception):
@@ -50,7 +51,7 @@ CHECKS = {
     "preview": (lambda v: isinstance(v, bool), "true or false"),
     "compact": (lambda v: isinstance(v, bool), "true or false"),
     "width": (lambda v: is_int(v) and v >= 200, "a whole number of pixels, 200 or more"),
-    "backend": (is_text, "a backend name"),
+    "backend": (lambda v: isinstance(v, str) and v in DEFAULT_MODELS, '"agent", "claude", "agy" or "codex"'),
     "idle_timeout": (lambda v: is_int(v) and v >= 0, "a whole number of minutes, 0 or more"),
 }
 ACTION_CHECKS = {key: CHECKS[key] for key in ("model", "preview")}
@@ -64,11 +65,20 @@ def check(where, settings, checks):
             raise ConfigError(f"{where}: {key} must be {wanted}")
 
 
-def resolve(defaults, user):
+def resolve(defaults, user, selection=None):
     check(CONFIG_DIR / "config.toml", user, CHECKS)
     config = {key: defaults[key] for key in SETTINGS if key in defaults}
     config.setdefault("backend", "agent")
     config.update({key: user[key] for key in SETTINGS if key in user})
+    if config["backend"] in ("agy", "codex") and "model" not in user:
+        config["model"] = DEFAULT_MODELS[config["backend"]]
+    selected = False
+    if isinstance(selection, dict) and selection.get("base") == [user.get("backend", "agent"), user.get("model")]:
+        backend = selection.get("backend")
+        model = selection.get("models", {}).get(backend) if isinstance(backend, str) and isinstance(selection.get("models"), dict) else None
+        if isinstance(backend, str) and backend in DEFAULT_MODELS and is_text(model):
+            config.update(backend=backend, model=model)
+            selected = True
 
     path = CONFIG_DIR / "config.toml" if "action" in user else PLUGIN_DIR / "config.toml"
     listed = user.get("action", defaults.get("action", []))
@@ -103,15 +113,25 @@ def resolve(defaults, user):
             resolved["id"] = next(c for c in candidates if c not in ids)
         ids.add(resolved["id"])
         resolved["instruction"] = action["instruction"].strip()
-        resolved.setdefault("model", config.get("model", "sonnet"))
+        if selected:
+            resolved["model"] = config["model"]
+        else:
+            resolved.setdefault("model", config.get("model", "sonnet"))
         resolved.setdefault("preview", config.get("preview", True))
         actions.append(resolved)
     return {"config": config, "actions": actions}
 
 
+def read_selection():
+    try:
+        return json.loads((CONFIG_DIR / "provider.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def main():
     try:
-        result = resolve(load(PLUGIN_DIR / "config.toml"), load(CONFIG_DIR / "config.toml"))
+        result = resolve(load(PLUGIN_DIR / "config.toml"), load(CONFIG_DIR / "config.toml"), read_selection())
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1

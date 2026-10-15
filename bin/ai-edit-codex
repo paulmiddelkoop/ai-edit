@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""One isolated rewrite through Codex app-server, warm or from stdin."""
+
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL = "gpt-6.1-sol"
+MAX_REQUEST = 4 * 1024 * 1024
+TIMEOUT = int(os.environ.get("AI_EDIT_TURN_TIMEOUT", "60"))
+
+
+class CodexError(Exception):
+    pass
+
+
+def executable():
+    path = shutil.which(os.environ.get("AI_EDIT_CODEX", "codex"))
+    if not path:
+        raise CodexError("codex is not installed")
+    # Shims and wrappers need the real executable before HOME is hidden.
+    candidate = Path(path)
+    with candidate.open("rb") as source:
+        header = source.read(4096)
+    shim = candidate.parent.name == "shims" and candidate.parent.parent.name == "mise"
+    if shim or (header[:2] == b"#!" and b"mise use" in header):
+        result = subprocess.run(["mise", "which", "codex"], capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise CodexError("codex could not be located through mise")
+        path = result.stdout.strip()
+    return str(Path(path).resolve())
+
+
+def persist_auth(source, initial, refreshed, runtime):
+    if refreshed == initial:
+        return
+    lock = runtime / ("ai-edit-codex-auth-" + hashlib.sha256(str(source).encode()).hexdigest()[:16] + ".lock")
+    with lock.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        # Keep a newer login or refresh if another client has changed the file.
+        if not source.exists() or source.read_bytes() != initial:
+            return
+        if not isinstance(json.loads(refreshed), dict):
+            raise CodexError("Codex returned invalid refreshed credentials")
+        descriptor, temporary = tempfile.mkstemp(prefix=".ai-edit-auth-", dir=source.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(refreshed)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, source)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def settings(directory, model):
+    overrides = {
+        'model': model, 'model_reasoning_effort': "low",
+        'service_tier': "default", 'project_doc_max_bytes': 0,
+        'approval_policy': 'never', 'sandbox_mode': 'read-only',
+        'web_search': 'disabled', 'features.hooks': False,
+        'features.shell_tool': False, 'features.code_mode': False,
+        'features.multi_agent': False, 'features.apps': False,
+        'features.memories': False, 'apps._default.enabled': False,
+        'history.persistence': 'none',
+        'model_catalog_json': str(directory / "models.json"),
+        'model_instructions_file': str(directory / 'system-prompt.txt'),
+        'tools.update_plan.enabled': False,
+        'tools.experimental_request_user_input.enabled': False,
+    }
+    overrides.update({
+        'features.skip_host_skill_discovery': True,
+        'skills.include_instructions': False,
+        'include_apps_instructions': False,
+        'include_collaboration_mode_instructions': False,
+        'include_environment_context': False,
+        'features.multi_agent_v2.enabled': False,
+        'features.multi_agent_v2.usage_hint_enabled': False,
+        'features.multi_agent_v2.root_agent_usage_hint_text': '',
+        'features.multi_agent_v2.usage_hint_text': '',
+        'features.multi_agent_v2.multi_agent_mode_hint_text': '',
+    })
+    for name in ['plugins', 'code_mode_host', 'goals', 'sleep_tool',
+                 'image_generation', 'view_image', 'browser_use', 'computer_use',
+                 'unified_exec', 'skill_search', 'tool_suggest', 'shell_snapshot',
+                 'workspace_dependencies']:
+        overrides['features.' + name] = False
+    return overrides
+
+
+class Server:
+    def __init__(self, directory, model):
+        self.directory = directory
+        self.model = model
+        self.proc = None
+        self.events = queue.Queue()
+        self.seq = 0
+        self.runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
+        self.auth_source = codex_home / "auth.json"
+        if not self.auth_source.is_file():
+            raise CodexError("Codex needs file-based authentication; run codex login first")
+        self.initial_auth = self.auth_source.read_bytes()
+        try:
+            catalog = json.loads((codex_home / "models_cache.json").read_text())
+            entry = next(item for item in catalog["models"] if item["slug"] == model)
+        except (OSError, ValueError, KeyError, StopIteration):
+            raise CodexError("Codex model is absent from its cached catalog; start codex to refresh available models")
+        entry = dict(entry, tool_mode="direct", multi_agent_version="v1",
+                     experimental_supported_tools=[], apply_patch_tool_type=None)
+        entry.pop("model_messages", None)
+        entry["base_instructions"] = (ROOT / "system-prompt.txt").read_text().strip()
+        (directory / "models.json").write_text(json.dumps({"models": [entry]}))
+        (directory / "system-prompt.txt").write_text(entry["base_instructions"])
+        self.home = directory / "home"
+        self.home.mkdir()
+        self.codex_home = self.home / ".codex"
+        self.codex_home.mkdir()
+        self.auth_copy = self.codex_home / "auth.json"
+        self.auth_copy.write_bytes(self.initial_auth)
+        self.auth_copy.chmod(0o600)
+        self.work = directory / "work"
+        self.work.mkdir()
+        binary = executable()
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            raise CodexError("bwrap is not installed (required for private Codex state)")
+        self.prefix = [bwrap, "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev",
+                       "--proc", "/proc", "--unshare-pid", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp",
+                       "--tmpfs", str(Path.home()), "--bind", str(directory), str(directory),
+                       "--ro-bind", binary, str(directory / "codex"), "--chdir", str(self.work)]
+        for key, value in {"HOME": self.home, "CODEX_HOME": self.codex_home,
+                           "XDG_CONFIG_HOME": self.home / ".config", "XDG_DATA_HOME": self.home / ".local/share",
+                           "XDG_STATE_HOME": self.home / ".local/state", "XDG_CACHE_HOME": self.home / ".cache",
+                           "TMPDIR": directory}.items():
+            self.prefix += ["--setenv", key, str(value)]
+        self.prefix += ["--", str(directory / "codex")]
+        self.overrides = settings(directory, model)
+
+    def command(self, *arguments):
+        result = self.prefix + list(arguments)
+        for key, value in self.overrides.items():
+            result += ["-c", key + "=" + json.dumps(value)]
+        return result
+
+    def start(self):
+        # Revalidate version-sensitive context overrides using synthetic input only.
+        probe = subprocess.run(self.command("debug", "prompt-input", "AI Edit context check."),
+                               capture_output=True, text=True, timeout=20)
+        if probe.returncode:
+            raise CodexError("Codex context isolation check failed; this CLI version may be unsupported")
+        try:
+            messages = json.loads(probe.stdout)
+            if not isinstance(messages, list) or not messages:
+                raise CodexError("Codex context isolation check returned no messages")
+            found_input = False
+            for message in messages:
+                content = "".join(part.get("text", "") for part in message.get("content", []))
+                allowed = message.get("role") == "developer" and content.startswith("<permissions instructions>")
+                allowed |= message.get("role") == "user" and content == "AI Edit context check."
+                found_input |= message.get("role") == "user" and content == "AI Edit context check."
+                if not allowed:
+                    raise CodexError("Codex loaded unexpected instructions; rewrite cancelled")
+            if not found_input:
+                raise CodexError("Codex context isolation check did not contain its test input")
+        except (ValueError, TypeError, AttributeError):
+            raise CodexError("Codex context isolation check returned an invalid response")
+        self.proc = subprocess.Popen(self.command("app-server", "--strict-config", "--listen", "stdio://"),
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     text=True, bufsize=1, start_new_session=True)
+        threading.Thread(target=self.read, daemon=True).start()
+        self.rpc("initialize", {"clientInfo": {"name": "ai_edit", "title": "AI Edit", "version": "0.1.0"},
+                                "capabilities": {"experimentalApi": True}})
+        self.send({"method": "initialized"})
+
+    def read(self):
+        for line in self.proc.stdout:
+            try:
+                self.events.put(json.loads(line))
+            except ValueError:
+                self.events.put({"invalid": True})
+        self.events.put({"eof": True})
+
+    def send(self, value):
+        self.proc.stdin.write(json.dumps(value) + "\n")
+        self.proc.stdin.flush()
+
+    def next(self, deadline):
+        try:
+            value = self.events.get(timeout=max(0.01, deadline - time.monotonic()))
+        except queue.Empty:
+            raise CodexError(f"codex did not answer within {TIMEOUT} s")
+        if value.get("eof") or value.get("invalid"):
+            raise CodexError("codex exited or returned an invalid response")
+        if "method" in value and "id" in value:
+            self.send({"id": value["id"], "error": {"code": -32601, "message": "AI Edit does not allow tools"}})
+            raise CodexError("codex requested a tool or approval instead of rewriting")
+        return value
+
+    def rpc(self, method, params):
+        self.seq += 1
+        seq = self.seq
+        self.send({"id": seq, "method": method, "params": params})
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            value = self.next(deadline)
+            if value.get("id") == seq:
+                if "error" in value:
+                    raise CodexError("codex rejected the request; check model access and authentication")
+                return value.get("result", {})
+
+    def rewrite(self, content):
+        thread = self.rpc("thread/start", {"model": self.model, "allowProviderModelFallback": False,
+            "cwd": str(self.work), "ephemeral": True, "approvalPolicy": "never", "sandbox": "read-only",
+            "baseInstructions": (self.directory / "system-prompt.txt").read_text(), "developerInstructions": "",
+            "environments": [], "dynamicTools": [], "selectedCapabilityRoots": [],
+            "config": {"model_reasoning_effort": "low", "project_doc_max_bytes": 0}})
+        thread_id = thread["thread"]["id"]
+        if thread.get("model") != self.model:
+            raise CodexError("codex selected a different model; rewrite cancelled")
+        self.rpc("turn/start", {"threadId": thread_id, "effort": "low", "environments": [],
+            "input": [{"type": "text", "text": content, "text_elements": []}]})
+        answer = []
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            value = self.next(deadline)
+            params = value.get("params", {})
+            if params.get("threadId") != thread_id:
+                continue
+            if value.get("method") == "item/completed":
+                item = params.get("item", {})
+                if item.get("type") not in ("userMessage", "agentMessage", "reasoning"):
+                    raise CodexError("codex attempted a tool call instead of rewriting")
+                if item.get("type") == "agentMessage":
+                    answer.append(item.get("text", ""))
+            if value.get("method") == "turn/completed":
+                if params["turn"].get("status") != "completed":
+                    raise CodexError("codex could not complete the rewrite; run codex in a terminal to check the error")
+                return "\n".join(answer)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.proc.wait()
+        if hasattr(self, "auth_copy") and self.auth_copy.exists():
+            persist_auth(self.auth_source, self.initial_auth, self.auth_copy.read_bytes(), self.runtime)
+
+
+def stream(model):
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime or not Path(runtime).is_dir():
+        raise CodexError("XDG_RUNTIME_DIR is required for private Codex state")
+    with tempfile.TemporaryDirectory(prefix="ai-edit-codex-", dir=runtime) as temporary:
+        server = Server(Path(temporary), model)
+        try:
+            server.start()
+            line = sys.stdin.buffer.readline(MAX_REQUEST + 1)
+            if not line:
+                return None
+            if len(line) > MAX_REQUEST:
+                raise CodexError("text is too large")
+            request = json.loads(line)
+            content = "".join(part["text"] for part in request["message"]["content"])
+            return server.rewrite(content)
+        finally:
+            server.close()
+
+
+def common_module():
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("ai_edit_claude", str(ROOT / "bin/ai-edit-claude"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    common = importlib.util.module_from_spec(spec)
+    loader.exec_module(common)
+    return common
+
+
+def cold():
+    common = common_module()
+    worker = None
+    try:
+        raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
+        if len(raw) > MAX_REQUEST:
+            raise common.TurnError("text is too large")
+        request = common.parse_request(raw)
+        model = json.loads(raw).get("model") or DEFAULT_MODEL
+        if not isinstance(model, str):
+            raise common.TurnError("model must be a string")
+        worker = common.Worker(model, command=[str(Path(__file__).resolve()), "--stream", model],
+                               name="codex", terminate_grace=2)
+        reply = {"text": common.rewrite(worker, request)}
+    except (common.TurnError, OSError, ValueError) as error:
+        reply = {"error": str(error)}
+    finally:
+        if worker:
+            worker.stop()
+    print(json.dumps(reply), flush=True)
+    return 0 if "text" in reply else 1
+
+
+def terminated(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--stream":
+        signal.signal(signal.SIGTERM, terminated)
+        try:
+            response = stream(sys.argv[2])
+            if response is not None:
+                print(json.dumps({"type": "result", "subtype": "success", "result": response}), flush=True)
+        except (CodexError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+            message = str(error) if isinstance(error, CodexError) else "codex could not complete the rewrite"
+            print(json.dumps({"type": "result", "subtype": "error", "is_error": True, "result": message}), flush=True)
+            sys.exit(1)
+    else:
+        sys.exit(cold())
