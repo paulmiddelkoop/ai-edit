@@ -131,7 +131,7 @@ open AI Edit.
 | `fast` | `true` | Codex only: Fast mode, about half a second quicker per rewrite, at the cost of more of your plan's usage. |
 | `preview` | `true` | Show the result before pasting it. Shift with the letter does the opposite. |
 | `compact` | `false` | Hide the action list and key hints; the letters keep working and **?** shows them. |
-| `width` | `560` | Width of the overlay. |
+| `width` | `560` | Width of the overlay in pixels, about 56 characters per line. Try `720` if you often edit long emails. |
 | `idle_timeout` | `30` | Minutes without a rewrite before the waiting agent process stops to free its memory (about 170 MB per model for Claude, 120 MB for Codex). The next rewrite then takes a few seconds longer. `0` keeps it ready all the time. |
 
 ### Your own actions
