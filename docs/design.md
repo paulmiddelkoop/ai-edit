@@ -661,7 +661,7 @@ closes only that field. The overlay sends the text it shows to `ai-edit run
 <id> --diff` on stdin, so an edit in the field is what gets rewritten; a free
 prompt runs as `ai-edit run -` with the instruction in `AI_EDIT_INSTRUCTION`.
 
-Both fields are `TextEdit`s, also the one-line prompt, which is drawn like the
+Both fields are `TextEdit`s, also the prompt, which is drawn like the
 kit's `TextField`. An editable `TextInput` (what `TextField` builds on) reads
 the full clipboard text on every clipboard change to update `canPaste`, and
 since the overlay stays loaded it did so all the time, through Qt's Wayland

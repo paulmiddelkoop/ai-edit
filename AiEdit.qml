@@ -770,7 +770,7 @@ Item {
           id: promptBox
           visible: root.promptOpen
           width: parent.width
-          height: promptField.height + topPadding + bottomPadding + borderTop + borderBottom
+          height: promptScroll.height + topPadding + bottomPadding + borderTop + borderBottom
           leftPadding: Style.spacing.controlPaddingX
           rightPadding: Style.spacing.controlPaddingX
           topPadding: Style.spacing.inputPaddingY
@@ -780,9 +780,9 @@ Item {
           radius: Style.cornerRadius
 
           Text {
-            x: promptField.x
-            y: promptField.y
-            width: promptField.width
+            x: promptScroll.x
+            y: promptScroll.y
+            width: promptScroll.width
             visible: promptField.text === "" && promptField.preeditText === ""
             textFormat: Text.PlainText
             text: "Tell AI Edit what to do with the text"
@@ -791,28 +791,46 @@ Item {
             font: promptField.font
           }
 
-          TextEdit {
-            id: promptField
+          Flickable {
+            id: promptScroll
             x: promptBox.contentLeftInset
             y: promptBox.contentTopInset
             width: promptBox.width - promptBox.contentLeftInset - promptBox.contentRightInset
-            textFormat: TextEdit.PlainText
-            wrapMode: TextEdit.Wrap
-            color: Color.foreground
-            selectionColor: Style.selectionFillFor(Color.foreground, Color.accent)
-            selectedTextColor: Color.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.title
-            Keys.priority: Keys.BeforeItem
-            Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) {
-                root.promptOpen = false
-                root.promptOnResult = false
-                keyCatcher.forceActiveFocus()
-                event.accepted = true
-              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                root.runPrompt(promptField.text, (event.modifiers & Qt.ShiftModifier) !== 0)
-                event.accepted = true
+            // Up to four lines, then it scrolls, so a long pasted
+            // instruction cannot push the card off the screen.
+            height: Math.min(promptField.implicitHeight, Math.ceil(promptField.implicitHeight / Math.max(1, promptField.lineCount) * 4))
+            contentWidth: width
+            contentHeight: promptField.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            function ensureVisible(r) {
+              if (contentY >= r.y) contentY = r.y
+              else if (contentY + height <= r.y + r.height) contentY = r.y + r.height - height
+            }
+
+            TextEdit {
+              id: promptField
+              width: promptScroll.width
+              textFormat: TextEdit.PlainText
+              wrapMode: TextEdit.Wrap
+              color: Color.foreground
+              selectionColor: Style.selectionFillFor(Color.foreground, Color.accent)
+              selectedTextColor: Color.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              onCursorRectangleChanged: promptScroll.ensureVisible(cursorRectangle)
+              Keys.priority: Keys.BeforeItem
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.promptOpen = false
+                  root.promptOnResult = false
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  root.runPrompt(promptField.text, (event.modifiers & Qt.ShiftModifier) !== 0)
+                  event.accepted = true
+                }
               }
             }
           }
