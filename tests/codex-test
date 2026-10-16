@@ -45,15 +45,17 @@ expect "dead server" '{"error": "Error: fake codex gave up"}' "$(ask die hi)"
 expect "timeout" '{"error": "codex did not answer within 2 s"}' "$(ask hang hi)"
 expect "no approvals" '{"error": "codex asked for item/commandExecution/requestApproval, which AI Edit does not allow"}' "$(ask ask hi)"
 expect "no tools" '{"error": "codex tried to use commandExecution"}' "$(ask tool hi)"
+expect "a tool is refused when it starts" '{"error": "codex tried to use collabAgentToolCall"}' "$(ask spawn hi)"
 expect "unknown model" '{"error": "Codex has no model gpt-none"}' \
   "$(jq -cn '{agent: "codex", model: "gpt-none", instruction: "echo", text: "hi"}' | "$root/bin/ai-edit-agent")"
 
 expect "codex runs in its own home" "$home" "$(jq -r .home "$FAKE_CODEX_LOG" | sort -u)"
 expect "auth is linked, not copied" "$CODEX_HOME/auth.json" "$(readlink "$home/auth.json")"
 expect "catalog without coding tools" true "$(jq --rawfile prompt "$root/system-prompt.txt" '.models[0] |
-  .tool_mode == "direct" and .multi_agent_version == "v1" and .experimental_supported_tools == []
+  .tool_mode == "direct" and .multi_agent_version == "disabled" and .experimental_supported_tools == []
   and .apply_patch_tool_type == null and (has("model_messages") | not)
   and .base_instructions == ($prompt | rtrimstr("\n"))' "$home/models-gpt-test.json")"
+expect "agent tools are off" true "$(jq -s 'map(select(.command[0] == "app-server" or .command[0] == "debug")) | length > 0 and all(.[]; .settings["agents.enabled"] == false)' "$FAKE_CODEX_LOG")"
 expect "context checked once per setup" 2 "$(jq -r 'select(.command[0] == "debug") | 1' "$FAKE_CODEX_LOG" | wc -l)"
 FAKE_CODEX_VERSION=0.2.0 ask echo hi >/dev/null
 expect "a new codex version is checked again" 3 "$(jq -r 'select(.command[0] == "debug") | 1' "$FAKE_CODEX_LOG" | wc -l)"

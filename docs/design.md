@@ -241,7 +241,7 @@ authentication solution: it cannot save refreshed credentials.
 
 Feature flags alone did not remove the coding tools selected by the model
 catalog. A temporary catalog preserves the requested model but switches its
-local tool mode to `direct` and multi-agent version to `v1`, removes patch
+local tool mode to `direct` and multi-agent version to `disabled`, removes patch
 and experimental tool capabilities, and replaces its default instructions
 with AI Edit's system prompt. Shell, agents, apps, skills, hooks, planning
 and user-input tools are disabled. These catalog overrides are specific to
@@ -314,6 +314,18 @@ probe text and the permissions message would be sent. The result is
 remembered per version and settings, since the check costs about a second.
 The codex path is not resolved: under mise it is a shim, and resolving it
 runs mise itself.
+
+That check sees the messages, not the tools. With multi-agent version `v1`
+in the catalog, Codex 0.163 still offered `spawn_agent` and the other agent
+tools: a catalog version wins over `features.multi_agent = false`, and only
+`agents.enabled = false` overrides it (`multi_agent_version_override` in
+`codex-rs/core/src/config/mod.rs`). A spawned agent can take local images as
+input, so a prompt injection in the text could have sent the user's images
+along (found in the marketplace review of 0.2.0). The catalog now says
+`disabled` and the bridge sets `agents.enabled = false`; a request then
+carries 273 input tokens instead of 512, with no measurable change in
+latency (about 3 s for GPT-6.1 Sol either way, two runs each). The bridge
+also refuses a tool when its item starts, not when it completes.
 
 The separate home does not leave out `/etc/codex/config.toml` (found by the
 security review on October 16). An MCP server configured there would start

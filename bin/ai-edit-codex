@@ -46,7 +46,7 @@ TURN_TIMEOUT = int(os.environ.get("AI_EDIT_TURN_TIMEOUT", "60"))
 PROBE = "AI Edit context check."
 
 OVERRIDES = {
-    "approval_policy": "never", "sandbox_mode": "read-only",
+    "approval_policy": "never", "sandbox_mode": "read-only", "agents.enabled": False,
     "cli_auth_credentials_store": "file", "project_doc_max_bytes": 0,
     "history.persistence": "none", "analytics.enabled": False,
     "web_search": "disabled", "apps._default.enabled": False,
@@ -96,8 +96,9 @@ def prepare_home(model_slug, system_prompt):
     model = next((m for m in catalog.get("models", []) if m.get("slug") == model_slug), None)
     if model is None:
         raise Failure(f"Codex has no model {model_slug}")
-    # The coding tools come with the catalog entry, not with feature flags.
-    model.update(tool_mode="direct", multi_agent_version="v1",
+    # The coding tools come with the catalog entry, not with feature flags: a
+    # catalog version of the agent tools wins over features.multi_agent.
+    model.update(tool_mode="direct", multi_agent_version="disabled",
                  experimental_supported_tools=[], apply_patch_tool_type=None,
                  base_instructions=system_prompt)
     model.pop("model_messages", None)
@@ -315,12 +316,13 @@ def turn(server, model, fast, content, system_prompt):
         if params.get("threadId") != thread:
             continue
         method = event.get("method")
-        if method == "item/completed":
+        if method in ("item/started", "item/completed"):
+            # Refused when it starts, before Codex has run it to the end.
             item = params.get("item") or {}
-            if item.get("type") == "agentMessage":
-                answer.append(item.get("text", ""))
-            elif item.get("type") not in ("userMessage", "reasoning"):
+            if item.get("type") not in ("agentMessage", "userMessage", "reasoning"):
                 raise Failure(f"codex tried to use {item.get('type')}")
+            if method == "item/completed" and item.get("type") == "agentMessage":
+                answer.append(item.get("text", ""))
         elif method == "error":
             error = error_text(params.get("error")) or error
         elif method == "turn/completed":

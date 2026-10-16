@@ -80,6 +80,9 @@ for line in sys.stdin:
             time.sleep(3600)
         if instruction == "tool":
             notify("item/completed", item={"type": "commandExecution", "command": "ls"})
+        if instruction == "spawn":
+            notify("item/started", item={"type": "collabAgentToolCall", "tool": "spawnAgent"})
+            time.sleep(3600)
         if instruction == "fail":
             notify("error", error={"message": "You've hit your usage limit."})
             notify("turn/completed", turn={"status": "failed", "error": {"message": "You've hit your usage limit."}})
