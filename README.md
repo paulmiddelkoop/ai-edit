@@ -194,9 +194,8 @@ tests/codex-test
 
 - **More coding agents.** The other agents Omarchy can set up, beyond Claude
   Code and Codex.
-- **An API key instead of a coding agent**, if people want it: an Anthropic
-  or OpenAI key, read through a command such as `op read`. Open an issue if
-  you would use it.
+- **An API key instead of a coding agent**, such as an Anthropic or OpenAI
+  key, if people want it. Open an issue if you would use it.
 
 ## Credits & license
 
