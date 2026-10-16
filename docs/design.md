@@ -313,6 +313,16 @@ remembered per version and settings, since the check costs about a second.
 The codex path is not resolved: under mise it is a shim, and resolving it
 runs mise itself.
 
+The separate home does not leave out `/etc/codex/config.toml` (found by the
+security review on October 16). An MCP server configured there would start
+with the app-server and give a prompt injection in the text a tool that runs
+without approval; the bridge only sees the call when it has run. So each
+start lists the effective servers with `codex mcp list --json`, switches each
+off by name (`mcp_servers.<name>.enabled = false`; an empty `mcp_servers`
+table does not override them), lists again to confirm, and after
+initializing asks `mcpServerStatus/list` and refuses when any server offers
+tools.
+
 Model choice, measured with the isolated benchmark on Codex 0.163.0, low
 effort (the lowest every candidate offers), six synthetic texts twice per
 condition, run sequentially ([results](benchmarks/2026-10-16-models.json)):

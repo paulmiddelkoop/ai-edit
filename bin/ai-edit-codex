@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -119,11 +120,13 @@ def prepare_home(model_slug, system_prompt):
     return model, catalog_file
 
 
-def command(codex, model, catalog_file, fast, *arguments):
+def command(codex, model, catalog_file, fast, *arguments, mcp_off=()):
     settings = dict(OVERRIDES, model=model["slug"], model_reasoning_effort=lowest_effort(model),
                     service_tier="priority" if fast else "default",
                     model_catalog_json=str(catalog_file),
                     model_instructions_file=str(SYSTEM_PROMPT_FILE))
+    for name in mcp_off:
+        settings[f"mcp_servers.{name}.enabled"] = False
     argv = [codex, *arguments]
     for key, value in settings.items():
         argv += ["-c", f"{key}={json.dumps(value)}"]
@@ -134,9 +137,40 @@ def environment():
     return dict(os.environ, CODEX_HOME=str(HOME))
 
 
-def check_context(codex, model, catalog_file, fast):
+def mcp_servers(codex, model, catalog_file, fast, mcp_off):
+    argv = command(codex, model, catalog_file, fast, "mcp", "list", "--json", mcp_off=mcp_off)
+    try:
+        result = subprocess.run(argv, cwd=WORK_DIR, env=environment(), capture_output=True,
+                                text=True, timeout=30)
+        servers = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        servers = None
+    if not isinstance(servers, list):
+        raise Failure("codex could not list its MCP servers")
+    return servers
+
+
+def switch_off_mcp(codex, model, catalog_file, fast):
+    """The MCP servers to switch off, checked to be off.
+
+    The separate home leaves out the user's servers, but Codex still reads
+    /etc/codex/config.toml. A server there would give a prompt injection in
+    the text a tool that runs without approval, so each one is switched off
+    by name, which an empty mcp_servers table does not do.
+    """
+    names = [server.get("name", "") for server in mcp_servers(codex, model, catalog_file, fast, ())]
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise Failure(f"Codex has an MCP server AI Edit cannot switch off: {name}")
+    if any(server.get("enabled") is not False
+           for server in mcp_servers(codex, model, catalog_file, fast, names)):
+        raise Failure("Codex keeps an MCP server on; AI Edit does not send it text")
+    return names
+
+
+def check_context(codex, model, catalog_file, fast, mcp_off):
     """Refuses a Codex that would send more than the text, once per setup."""
-    argv = command(codex, model, catalog_file, fast, "debug", "prompt-input", PROBE)
+    argv = command(codex, model, catalog_file, fast, "debug", "prompt-input", PROBE, mcp_off=mcp_off)
     try:
         version = subprocess.run([codex, "--version"], env=environment(), capture_output=True,
                                  text=True, timeout=30).stdout.strip()
@@ -318,13 +352,18 @@ def main():
         with open(HOME / ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             model, catalog_file = prepare_home(args.model, system_prompt)
-            check_context(codex, model, catalog_file, args.fast)
+            mcp_off = switch_off_mcp(codex, model, catalog_file, args.fast)
+            check_context(codex, model, catalog_file, args.fast, mcp_off)
         server = Server(command(codex, model, catalog_file, args.fast,
-                                "app-server", "--strict-config", "--listen", "stdio://"))
+                                "app-server", "--strict-config", "--listen", "stdio://",
+                                mcp_off=mcp_off))
         deadline = time.monotonic() + 30
         server.rpc("initialize", {"clientInfo": {"name": "ai_edit", "version": "1"},
                                   "capabilities": {"experimentalApi": True}}, deadline)
         server.send({"method": "initialized"})
+        status = server.rpc("mcpServerStatus/list", {"detail": "toolsAndAuthOnly"}, deadline)
+        if any(entry.get("tools") for entry in status.get("data") or []):
+            raise Failure("Codex offers MCP tools; AI Edit does not send it text")
 
         line = sys.stdin.readline()
         if not line:

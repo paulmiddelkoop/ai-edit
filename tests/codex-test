@@ -63,6 +63,16 @@ expect "extra context is refused" '{"error": "This Codex version would send more
   "$(FAKE_CODEX_LEAK=1 ask echo hi)"
 expect "no server after a refused check" 0 "$(jq -r 'select(.command[0] == "app-server") | 1' "$FAKE_CODEX_LOG" | wc -l)"
 
+FAKE_CODEX_MCP="files mail" ask echo hi >/dev/null
+expect "system MCP servers are switched off" '{"mcp_servers.files.enabled":false,"mcp_servers.mail.enabled":false}' \
+  "$(jq -c 'select(.command[0] == "app-server") | .settings | with_entries(select(.key | startswith("mcp_servers")))' "$FAKE_CODEX_LOG" | tail -1)"
+expect "an MCP server that stays on is refused" '{"error": "Codex keeps an MCP server on; AI Edit does not send it text"}' \
+  "$(FAKE_CODEX_MCP="files:stuck" ask echo hi)"
+expect "MCP tools at runtime are refused" '{"error": "Codex offers MCP tools; AI Edit does not send it text"}' \
+  "$(FAKE_CODEX_MCP="files:tools" ask echo hi)"
+expect "an MCP name that cannot be switched off is refused" '{"error": "Codex has an MCP server AI Edit cannot switch off: a.b"}' \
+  "$(FAKE_CODEX_MCP="a.b" ask echo hi)"
+
 # A worker and its replacement starting at once on an empty home.
 rm -rf "$home"
 for n in 1 2 3; do ask echo "together $n" >"$tmp/together-$n" & done

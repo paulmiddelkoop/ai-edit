@@ -3,7 +3,9 @@
 
 The instruction in a turn picks the behaviour, as in fake-claude.
 FAKE_CODEX_LEAK makes the prompt check show extra context,
-FAKE_CODEX_VERSION sets what --version says; FAKE_CODEX_LOG
+FAKE_CODEX_VERSION sets what --version says, FAKE_CODEX_MCP names MCP servers
+from a system config (":stuck" keeps one on, ":tools" gives it tools once
+off); FAKE_CODEX_LOG
 names a file that gets one line per start with CODEX_HOME and the settings.
 """
 import json
@@ -22,6 +24,14 @@ if os.environ.get("FAKE_CODEX_LOG"):
 
 if command == ["--version"]:
     print("codex-cli " + os.environ.get("FAKE_CODEX_VERSION", "0.1.0"))
+    sys.exit(0)
+
+servers = [entry.split(":") for entry in os.environ.get("FAKE_CODEX_MCP", "").split()]
+
+if command[:3] == ["mcp", "list", "--json"]:
+    print(json.dumps([{"name": name, "enabled": "stuck" in flags or
+                       settings.get(f"mcp_servers.{name}.enabled", True)}
+                      for name, *flags in servers]))
     sys.exit(0)
 
 if command[:2] == ["debug", "prompt-input"]:
@@ -49,6 +59,9 @@ for line in sys.stdin:
     method, seq, params = message.get("method"), message.get("id"), message.get("params") or {}
     if method == "initialize":
         send({"id": seq, "result": {"userAgent": "fake"}})
+    elif method == "mcpServerStatus/list":
+        send({"id": seq, "result": {"data": [{"name": name, "tools": {"x": {}} if "tools" in flags else {}}
+                                             for name, *flags in servers]}})
     elif method == "thread/start":
         send({"id": seq, "result": {"thread": {"id": "t1"}, "model": params["model"],
                                     "serviceTier": params["serviceTier"]}})
