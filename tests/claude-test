@@ -41,6 +41,8 @@ got=$(python3 -c 'import json; print(json.dumps({"instruction": "echo", "text": 
 expect "timeout covers a blocked write" '{"error": "claude did not answer within 2 s"}' "$got"
 expect "blocked write ends in time" yes "$( ((SECONDS - started <= 5)) && echo yes || echo no)"
 # A custom instruction from the terminal, end to end through bin/ai-edit.
+mkdir -p "$XDG_CONFIG_HOME/ai-edit"
+printf 'agent = "claude"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
 expect "custom instruction" "HELLO THERE" "$(printf 'hello there' | AI_EDIT_INSTRUCTION=echo "$root/bin/ai-edit" run -)"
 expect "bad request" '{"error": "request is not JSON"}' "$(echo nope | "$root/bin/ai-edit-agent")"
 sleep 0.5

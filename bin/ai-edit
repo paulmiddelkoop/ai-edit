@@ -694,6 +694,7 @@ selftest() {
     export XDG_CONFIG_HOME=$STATE_DIR/xdg
     mkdir -p "$XDG_CONFIG_HOME/ai-edit"
     cat >"$XDG_CONFIG_HOME/ai-edit/config.toml" <<'TOML'
+agent = "claude"
 model = "haiku"
 preview = false
 idle_timeout = 0
