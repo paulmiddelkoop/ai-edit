@@ -14,6 +14,10 @@ SAVED_DATA=$STATE_DIR/clipboard.data
 LOCK=$STATE_DIR/lock
 HISTORY=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/clipboard-history.json
 COPY_WAIT_MS=250
+# Text as large as the overlay rewrites (Service.qml's maxText), and room for
+# a screenshot on the clipboard that capture puts back.
+MAX_TEXT=$((4 * 1024 * 1024))
+MAX_SAVED=$((64 * 1024 * 1024))
 
 umask 077
 
@@ -49,6 +53,11 @@ Usage: ai-edit <command>
               the text on stdin
   copy [-]    put the result on the clipboard; with -, the text on stdin
   compare     store {original, result} from stdin and print the diff
+  paste [--primary]
+              print the text on the clipboard (or the primary selection) for
+              the overlay's text fields to insert
+  clip        put the text on stdin on the clipboard, for the overlay's
+              text fields
   selftest    check the copy loop and the session files without a compositor
 EOF
 }
@@ -104,6 +113,29 @@ window_exists() {
 
 # --------------------------------------------------------------- clipboard
 
+# wl-copy buffers what it serves in $TMPDIR, /tmp by default, which may be on
+# disk.
+wl-copy() {
+  mkdir -p "$STATE_DIR"
+  TMPDIR=$STATE_DIR command wl-copy "$@"
+}
+
+# A clipboard owner can stream without end or stall: every read is bounded in
+# size and time. Returns 2 when the data is larger than <max> (the file then
+# holds its first <max> bytes), 124 when the owner did not finish in time,
+# otherwise wl-paste's status.
+read_clipboard() {
+  local file="$1" max="$2" status
+  shift 2
+  timeout 2 wl-paste "$@" 2>/dev/null 9>&- | head -c $((max + 1)) >"$file"
+  status=${PIPESTATUS[0]}
+  if (($(stat -c %s "$file") > max)); then
+    truncate -s "$max" "$file"
+    return 2
+  fi
+  return "$status"
+}
+
 # Through files, never a variable: bash drops NUL bytes, and an image on the
 # clipboard would come back broken. One type is kept, the richest one an app
 # is likely to want back. Fails when there is something on the clipboard that
@@ -122,7 +154,7 @@ save_clipboard() {
   type=$(grep -m1 -E '^image/png$' <<<"$types" ||
     grep -m1 -E '^text/plain;charset=utf-8$' <<<"$types" ||
     head -1 <<<"$types")
-  if ! timeout 2 wl-paste --no-newline --type "$type" >"$SAVED_DATA" 2>/dev/null; then
+  if ! read_clipboard "$SAVED_DATA" "$MAX_SAVED" --no-newline --type "$type"; then
     rm -f "$SAVED_DATA"
     return 1
   fi
@@ -151,7 +183,9 @@ restore_clipboard() {
 # One press is enough: on Brave, Slack (XWayland) and foot, with Super still
 # held from the keybinding, the copy landed within 0.1 s every time. Nothing
 # on the clipboard after COPY_WAIT_MS means nothing is selected, and that
-# wait is what opening an empty field costs.
+# wait is what opening an empty field costs. Returns 2 when the selection is
+# too large to rewrite and 3 when its transfer was cut off; $CAPTURE then
+# holds the part that was read.
 copy_selection() {
   local kind="$1" deadline
   : >"$CAPTURE"
@@ -160,12 +194,12 @@ copy_selection() {
   while (($(now_ms) < deadline)); do
     sleep 0.025
     if timeout 1 wl-paste --list-types 2>/dev/null | grep -qiE '^(text/|UTF8_STRING$)'; then
-      if ! timeout 2 wl-paste --no-newline --type text >"$CAPTURE" 2>/dev/null; then
-        # A transfer that was cut off holds only part of the selection.
-        : >"$CAPTURE"
-        return 1
-      fi
-      [[ -s $CAPTURE ]] && return 0
+      read_clipboard "$CAPTURE" "$MAX_TEXT" --no-newline --type text
+      case $? in
+        0) [[ -s $CAPTURE ]] && return 0 ;;
+        2) return 2 ;;
+        *) return 3 ;;
+      esac
     fi
   done
   return 1
@@ -206,9 +240,15 @@ write_session() {
 # Each capture has its own directory, so a second capture during the wait
 # does not change what the first one removes.
 forget_capture() {
-  local dir="$1" before=$1/history.before text=$1/forget.txt
+  local dir="$1" before=$1/history.before text=$1/forget.txt match='.text == $text'
+  # A capture that was too large or cut off knows only how the copy starts.
+  [[ -e $dir/prefix ]] && match='(.text | startswith($text))'
   [[ -s $before ]] || printf '[]' >"$before"
-  if jq -e --rawfile text "$text" 'any(.[]?; .type == "text" and .text == $text)' "$before" >/dev/null 2>&1; then
+  # An entry that was in the history before is the user's own copy.
+  local ours="def ours: .type == \"text\" and $match and
+    (.text as \$t | \$before[0] | any(.[]?; .type == \"text\" and .text == \$t)) == false;"
+  if [[ ! -s $text ]] || { [[ ! -e $dir/prefix ]] &&
+    jq -e --rawfile text "$text" 'any(.[]?; .type == "text" and .text == $text)' "$before" >/dev/null 2>&1; }; then
     rm -rf "$dir"
     return
   fi
@@ -216,11 +256,11 @@ forget_capture() {
   for tries in {1..30}; do
     sleep 0.1
     if [[ -s $HISTORY ]] &&
-      jq -e --rawfile text "$text" 'any(.[]?; .type == "text" and .text == $text)' "$HISTORY" >/dev/null 2>&1; then
+      jq -e --rawfile text "$text" --slurpfile before "$before" "$ours any(.[]?; ours)" "$HISTORY" >/dev/null 2>&1; then
       # Written beside the history, so the rename that replaces it is atomic.
       local new
       new=$(mktemp "$HISTORY.ai-edit.XXXXXX") || break
-      jq --rawfile text "$text" 'map(select(.type != "text" or .text != $text))' "$HISTORY" >"$new" &&
+      jq --rawfile text "$text" --slurpfile before "$before" "$ours map(select(ours | not))" "$HISTORY" >"$new" &&
         mv "$new" "$HISTORY"
       rm -f "$new"
       break
@@ -233,7 +273,7 @@ forget_capture() {
 # window with nothing selected would come back with some other window's text.
 capture() {
   mkdir -p "$STATE_DIR"
-  local window kind address editable=unknown
+  local window kind address editable=unknown copied=1
   window=$(hyprctl activewindow -j 2>/dev/null)
   kind=$(window_kind <<<"$window")
   address=$(jq -r '.address // ""' <<<"$window" 2>/dev/null)
@@ -247,11 +287,20 @@ capture() {
     forget=$(mktemp -d "$STATE_DIR/forget.XXXXXX") || die "cannot write to $STATE_DIR"
     [[ -s $HISTORY ]] && cp "$HISTORY" "$forget/history.before"
     trap restore_clipboard EXIT
-    wl-copy --clear 9>&- && copy_selection "$kind"
+    wl-copy --clear 9>&- && { copy_selection "$kind"; copied=$?; }
     restore_clipboard
     trap - EXIT
+    ((copied == 2)) && notify-send -a "AI Edit" "AI Edit" "The selection is too large to rewrite." 2>/dev/null 9>&-
     if [[ -s $CAPTURE ]]; then
-      cp "$CAPTURE" "$forget/forget.txt"
+      if ((copied == 0)); then
+        cp "$CAPTURE" "$forget/forget.txt"
+      else
+        # The history has the whole copy; what was read is only its start,
+        # without a character cut in half at the end.
+        head -c 65536 "$CAPTURE" | iconv -f UTF-8 -t UTF-8 -c >"$forget/forget.txt" 2>/dev/null
+        : >"$forget/prefix"
+        : >"$CAPTURE"
+      fi
       forget_capture "$forget" >/dev/null 2>&1 9>&- &
       disown
     else
@@ -266,6 +315,32 @@ compose() {
   rm -f "$RESULT"
   : >"$CAPTURE"
   write_session "" none
+}
+
+# Qt's own paste reads the clipboard inside the shell, synchronously and with
+# no limit on size or time; the overlay's text fields paste through this.
+paste_text() {
+  [[ -z ${1:-} || $1 == --primary ]] || die "usage: ai-edit paste [--primary]"
+  mkdir -p "$STATE_DIR"
+  local file status
+  file=$(mktemp "$STATE_DIR/paste.XXXXXX") || die "cannot write to $STATE_DIR"
+  read_clipboard "$file" "$MAX_TEXT" --no-newline --type text ${1:+--primary}
+  status=$?
+  # 1 is an empty clipboard, or one without text.
+  ((status <= 1)) && cat "$file"
+  rm -f "$file"
+  case $status in
+    0 | 1) ;;
+    2) die "The clipboard text is too large to paste" ;;
+    124) die "The clipboard took too long to hand over its text" ;;
+    *) die "The clipboard could not be read" ;;
+  esac
+}
+
+# The overlay's copy: wl-copy serves it from its own process, where Qt would
+# serve it from the shell.
+clip() {
+  wl-copy --type 'text/plain;charset=utf-8' 9>&-
 }
 
 # --------------------------------------------------------------- overlay
@@ -567,9 +642,55 @@ selftest() {
   cut_off() (
     press() { :; }
     wl-paste() { [[ $1 == --list-types ]] && printf 'text/plain;charset=utf-8\n' || { printf 'part'; return 124; }; }
-    ! copy_selection wayland && [[ ! -s $CAPTURE ]]
+    copy_selection wayland
+    [[ $? == 3 && $(<"$CAPTURE") == part ]]
   )
   check "a copy that was cut off is not a selection" cut_off
+  too_large() (
+    MAX_TEXT=8
+    press() { :; }
+    wl-paste() { [[ $1 == --list-types ]] && printf 'text/plain;charset=utf-8\n' || yes; }
+    copy_selection wayland
+    [[ $? == 2 && $(stat -c %s "$CAPTURE") == 8 ]]
+  )
+  check "a selection too large to rewrite is not read without end" too_large
+  too_large_told() (
+    MAX_TEXT=8
+    hyprctl() { printf '{"address": "0xbeef", "xwayland": false, "tags": []}'; }
+    # Small while capture saves it, endless once the copy lands.
+    wl-paste() {
+      [[ $1 == --list-types ]] && { printf 'text/plain;charset=utf-8\n'; return; }
+      [[ -e $STATE_DIR/cleared ]] && yes || printf 'old'
+    }
+    wl-copy() { [[ $1 == --clear ]] && : >"$STATE_DIR/cleared" || cat >/dev/null; }
+    busctl() { return 1; }
+    press() { :; }
+    notify-send() { echo "$*" >"$STATE_DIR/told"; }
+    rm -f "$STATE_DIR/told" "$STATE_DIR/cleared"
+    capture
+    grep -q "too large" "$STATE_DIR/told" && jq -e '.source == "compose"' "$SESSION" >/dev/null
+  )
+  check "a selection too large to rewrite is told" too_large_told
+  paste_kept() (
+    wl-paste() { [[ " $* " == *" --primary "* ]] && printf 'primary\0x' || printf 'a "b"\n'; }
+    paste_text | cmp -s - <(printf 'a "b"\n') || exit 1
+    paste_text --primary | cmp -s - <(printf 'primary\0x') || exit 1
+    ! ls "$STATE_DIR"/paste.* >/dev/null 2>&1
+  )
+  check "paste hands over the text exactly" paste_kept
+  paste_bounded() (
+    MAX_TEXT=8
+    wl-paste() { yes; }
+    out=$(paste_text 2>&1) && exit 1
+    [[ $out == *"too large"* ]] || exit 1
+    wl-paste() { printf 'part'; return 124; }
+    out=$(paste_text 2>&1) && exit 1
+    [[ $out == *"too long"* ]] || exit 1
+    wl-paste() { return 1; }
+    [[ -z $(paste_text) ]] || exit 1
+    ! ls "$STATE_DIR"/paste.* >/dev/null 2>&1
+  )
+  check "paste is bounded in size and time" paste_bounded
 
   session_kept() {
     printf 'He said "no", then left.\nTwice.\n' >"$CAPTURE"
@@ -686,7 +807,19 @@ selftest() {
     first=$(forget_dir '[]' a) second=$(forget_dir '[]' b)
     forget_capture "$first"
     forget_capture "$second"
-    jq -e '. == []' "$HISTORY" >/dev/null
+    jq -e '. == []' "$HISTORY" >/dev/null || exit 1
+    # Of a capture that was too large only the start is known.
+    printf '[{"type": "text", "text": "huge secret"}, {"type": "text", "text": "huge old"}]' >"$HISTORY"
+    dir=$(forget_dir '[{"type": "text", "text": "huge old"}]' 'huge s')
+    : >"$dir/prefix"
+    forget_capture "$dir"
+    jq -e '. == [{"type": "text", "text": "huge old"}]' "$HISTORY" >/dev/null || exit 1
+    # An older copy with the same start stays, and does not keep the new one.
+    printf '[{"type": "text", "text": "huge secret"}, {"type": "text", "text": "huge same start"}]' >"$HISTORY"
+    dir=$(forget_dir '[{"type": "text", "text": "huge same start"}]' 'huge s')
+    : >"$dir/prefix"
+    forget_capture "$dir"
+    jq -e '. == [{"type": "text", "text": "huge same start"}]' "$HISTORY" >/dev/null
   )
   check "capture leaves no trace in the clipboard history" history_cleanup
 
@@ -834,6 +967,8 @@ case "$command" in
   insert) insert "$@" ;;
   copy) copy "$@" ;;
   compare) compare ;;
+  paste) paste_text "$@" ;;
+  clip) clip ;;
   selftest) selftest ;;
   -h | --help | help) usage ;;
   *)

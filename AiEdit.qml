@@ -459,6 +459,107 @@ Item {
     return false
   }
 
+  // Qt's own copy and paste in a TextEdit go through the shell's clipboard
+  // connection: a paste reads the owner's data with no limit on size or time,
+  // and a copy is served with a blocking write to whoever asks. Both go
+  // through bin/ai-edit instead, so a client that stalls or floods holds up a
+  // helper process, not the shell. The primary selection Qt sets on every
+  // selection it still serves itself: there is no way around that short of
+  // handling selection outside Qt.
+  function clipboardKey(field, event) {
+    if (event.matches(StandardKey.Paste)) {
+      root.paste(field, false)
+    } else if (event.matches(StandardKey.Copy) || event.matches(StandardKey.Cut)) {
+      if (field.selectedText === "") return true
+      var cut = event.matches(StandardKey.Cut) && !field.readOnly
+      root.clip({ text: field.selectedText, cut: cut ? root.snapshot(field) : null })
+    } else {
+      return false
+    }
+    return true
+  }
+
+  // What a field held when a clipboard action started; its result applies
+  // only while the field still holds exactly that.
+  function snapshot(field) {
+    return { field: field, run: root.runId, text: field.text, start: field.selectionStart, end: field.selectionEnd }
+  }
+
+  function unchanged(shot) {
+    var field = shot.field
+    return root.opened && shot.run === root.runId && field.visible && !field.readOnly &&
+      field.text === shot.text && field.selectionStart === shot.start && field.selectionEnd === shot.end
+  }
+
+  // The last copy wins; a cut removes its text only once the copy is made.
+  function clip(request) {
+    if (clipProc.running) {
+      clipProc.pending = request
+      return
+    }
+    clipProc.request = request
+    clipProc.running = true
+  }
+
+  Process {
+    id: clipProc
+    property var request: null
+    property var pending: null
+    command: [root.aiEditBin, "clip"]
+    stdinEnabled: true
+    onStarted: {
+      write(request.text)
+      stdinEnabled = false
+    }
+    onExited: function(code) {
+      stdinEnabled = true
+      var cut = request.cut
+      request = null
+      if (code === 0 && cut && root.unchanged(cut)) cut.field.remove(cut.start, cut.end)
+      var next = pending
+      pending = null
+      if (next) root.clip(next)
+    }
+  }
+
+  // Pasting into the empty field is the whole edit: it goes straight to the
+  // actions.
+  function paste(field, primary, position) {
+    if (pasteProc.running || field.readOnly) return
+    if (position !== undefined) {
+      field.forceActiveFocus()
+      field.cursorPosition = position
+    }
+    pasteProc.shot = root.snapshot(field)
+    pasteProc.leaveAfter = field === editor && editor.text === ""
+    pasteProc.command = [root.aiEditBin, "paste"].concat(primary ? ["--primary"] : [])
+    pasteProc.running = true
+  }
+
+  Process {
+    id: pasteProc
+    property var shot: null
+    property bool leaveAfter: false
+    stdout: StdioCollector { id: pasteOut; waitForEnd: true }
+    stderr: StdioCollector { id: pasteErr; waitForEnd: true }
+    onExited: function(code) {
+      var shot = pasteProc.shot
+      pasteProc.shot = null
+      // Typed on, closed or run meanwhile: the paste is for what is gone.
+      if (!shot || !root.unchanged(shot)) return
+      var field = shot.field
+      if (code !== 0) {
+        root.promptOpen = false
+        root.fail(pasteErr.text.trim().replace(/^ai-edit: /, "") || "The clipboard could not be read")
+        return
+      }
+      if (pasteOut.text === "") return
+      if (shot.start !== shot.end) field.remove(shot.start, shot.end)
+      field.insert(shot.start, pasteOut.text)
+      if (pasteProc.leaveAfter) root.leaveEditor()
+    }
+  }
+
   Process {
     id: stateProc
     command: [root.aiEditBin, "state"]
@@ -694,18 +795,12 @@ Item {
                 } else if (event.key === Qt.Key_Tab) {
                   root.leaveEditor()
                   event.accepted = true
-                } else if (editor.text === "" && ((ctrl && event.key === Qt.Key_V) || (shift && event.key === Qt.Key_Insert))) {
-                  // Pasting into the empty field is the whole edit: go
-                  // straight to the actions.
-                  leaveAfterPaste.restart()
+                } else if (root.clipboardKey(editor, event)) {
+                  event.accepted = true
                 }
               }
 
-              Timer {
-                id: leaveAfterPaste
-                interval: 60
-                onTriggered: root.leaveEditor()
-              }
+              PasteGuard { onPrimaryPaste: function(x, y) { root.paste(editor, true, editor.positionAt(x, y)) } }
             }
 
             Text {
@@ -830,8 +925,12 @@ Item {
                 } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                   root.runPrompt(promptField.text, (event.modifiers & Qt.ShiftModifier) !== 0)
                   event.accepted = true
+                } else if (root.clipboardKey(promptField, event)) {
+                  event.accepted = true
                 }
               }
+
+              PasteGuard { onPrimaryPaste: function(x, y) { root.paste(promptField, true, promptField.positionAt(x, y)) } }
             }
           }
         }

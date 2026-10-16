@@ -667,8 +667,24 @@ the full clipboard text on every clipboard change to update `canPaste`, and
 since the overlay stays loaded it did so all the time, through Qt's Wayland
 reader, which has a one-second timeout per chunk but no size limit or overall
 deadline: a clipboard owner could stall or exhaust the shell. `TextEdit` only
-checks the offered types, so the clipboard is read only on an actual paste.
-(Found in the marketplace review of 0.2.0, Qt 6.11/6.12.)
+checks the offered types. A paste itself would go through that same reader,
+so the fields never let Qt paste: the paste keys (`StandardKey.Paste`), a
+middle click (the primary selection) and a drop are taken before the
+`TextEdit` sees them, and the text comes from `ai-edit paste`, which reads it
+with `wl-paste` in its own process, at most 4 MiB and 2 s, and the shell
+inserts it when it arrives. The other direction has the same problem: Qt
+serves what the shell copies with a blocking `write()` to whoever asks, so a
+receiver that never reads holds up the shell once the text is larger than a
+pipe. Copy and cut go to `ai-edit clip`, where `wl-copy` serves them. The
+primary selection Qt sets on every selection made by mouse or keyboard it
+still serves itself: avoiding that means handling selection outside Qt, and
+every text field in the shell, Omarchy's own `TextField` included, shares
+it, so it belongs in Qt rather than in a plugin. Capture and
+the clipboard it saves and restores are bounded the same way (4 MiB of text,
+64 MiB saved). A capture that is too large or cut off is not used, but
+Omarchy's history watcher may still have the whole copy: its entry is
+removed by the start of its text. (Found in the marketplace review of 0.2.0,
+Qt 6.11/6.12.)
 
 The diff is computed by `bin/ai-edit diff` (Python `difflib` on words with
 whitespace tokens kept) and written as `diff.json`, a list of
