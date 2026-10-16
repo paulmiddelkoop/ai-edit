@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""ai-edit-opencode: opencode behind the protocol AI Edit speaks with claude.
+
+    ai-edit-opencode <provider/model> [--fast]
+
+Starts an opencode server ready for one rewrite, then reads one claude
+stream-json user message on stdin and answers with a claude result event on
+stdout, as bin/ai-edit-codex does for Codex. Exits after that turn, or when
+stdin closes first.
+
+The server gets a configuration directory of its own under $XDG_RUNTIME_DIR,
+so the user's opencode settings, AGENTS.md, agents, skills and plugins stay
+out. It keeps the user's database, which holds the login: opencode stores
+logins and sessions in one file. Each rewrite is a session in that database
+for the length of the turn, deleted after it; SQLite may keep the deleted
+text in the file until it reuses the space, which the README says.
+lib/opencode-guard.ts, loaded into the server, lets only AI Edit's system
+prompt and the text out, without tools; a probe checks it is in place before
+the server is used.
+"""
+
+import argparse
+import base64
+import ctypes
+import json
+import os
+import queue
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+SYSTEM_PROMPT_FILE = PLUGIN_DIR / "system-prompt.txt"
+GUARD = PLUGIN_DIR / "lib/opencode-guard.ts"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "ai-edit"
+WORK_DIR = STATE_DIR / "agent"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "ai-edit"
+HOME = RUNTIME_DIR / "opencode"
+TURN_TIMEOUT = int(os.environ.get("AI_EDIT_TURN_TIMEOUT", "60"))
+PROBE = "AI Edit context check."
+TITLE = "AI Edit"
+# The lowest reasoning a model offers, in the names opencode's variants use.
+EFFORTS = ("none", "minimal", "low")
+# Kept from the user's environment: where their login is.
+KEPT = ("OPENCODE_DB", "OPENCODE_DISABLE_CHANNEL_DB")
+
+
+class Failure(Exception):
+    pass
+
+
+def opencode_binary():
+    # Not resolved: a version manager's shim runs the manager itself then.
+    opencode = os.environ.get("AI_EDIT_OPENCODE") or shutil.which("opencode")
+    if not opencode:
+        raise Failure("opencode is not installed")
+    return opencode
+
+
+def settings(system_prompt):
+    return {
+        "agents": {
+            "rewrite": {"mode": "primary", "system": system_prompt,
+                        "permissions": [{"action": "*", "resource": "*", "effect": "deny"}]},
+            "title": {"disabled": True},
+        },
+        "plugins": ["-opencode.prompt.identity", "-opencode.tools", "-opencode.config.instruction"],
+        "snapshots": False,
+        "compaction": {"auto": False},
+        "share": "disabled",
+    }
+
+
+def prepare_home():
+    """The server's own configuration directory, holding only the guard."""
+    plugins = HOME / "config/plugins"
+    plugins.mkdir(parents=True, exist_ok=True, mode=0o700)
+    guard = GUARD.read_text()
+    target = plugins / "ai-edit-guard.ts"
+    if not target.is_file() or target.read_text() != guard:
+        temp = target.with_suffix(".tmp")
+        temp.write_text(guard)
+        temp.replace(target)
+    return HOME / "config"
+
+
+def environment(config_dir, system_prompt, password, status):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OPENCODE_") or k in KEPT}
+    env.update(
+        OPENCODE_CONFIG_DIR=str(config_dir),
+        OPENCODE_CONFIG_CONTENT=json.dumps(settings(system_prompt)),
+        OPENCODE_DISABLE_PROJECT_CONFIG="1", OPENCODE_DISABLE_CLAUDE_CODE="1",
+        OPENCODE_DISABLE_AUTOUPDATE="1", OPENCODE_PASSWORD=password,
+        AI_EDIT_SYSTEM_FILE=str(SYSTEM_PROMPT_FILE), AI_EDIT_PROBE=PROBE,
+        AI_EDIT_GUARD_STATUS=str(status),
+    )
+    return env
+
+
+def die_with_parent():
+    # The server must not outlive a bridge that is killed.
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)
+
+
+def last_line(lines):
+    return lines[-1][:300] if lines else ""
+
+
+class Server:
+    def __init__(self, opencode, env):
+        self.password = env["OPENCODE_PASSWORD"]
+        self.stderr = deque(maxlen=20)
+        self.lines = queue.Queue()
+        self.proc = subprocess.Popen(
+            [opencode, "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"],
+            cwd=WORK_DIR, env=env, text=True, bufsize=1,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=die_with_parent)
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        try:
+            line = self.lines.get(timeout=30)
+        except queue.Empty:
+            raise Failure("opencode did not start within 30 s")
+        try:
+            self.url = json.loads(line)["url"]
+        except (TypeError, ValueError, KeyError):
+            raise Failure(last_line(list(self.stderr)) or "opencode did not start")
+
+    def _read(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def _read_stderr(self):
+        for line in self.proc.stderr:
+            if line.strip():
+                self.stderr.append(line.strip()[:300])
+
+    def call(self, method, path, body=None, deadline=None):
+        timeout = 30 if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            raise Failure(f"opencode did not answer within {TURN_TIMEOUT} s")
+        auth = base64.b64encode(f"opencode:{self.password}".encode()).decode()
+        request = urllib.request.Request(
+            self.url + path, method=method,
+            headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"},
+            data=None if body is None else json.dumps(body).encode())
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = response.read()
+        except urllib.error.HTTPError as error:
+            raise Failure(f"opencode refused {method} {path.split('?')[0]}: {error.code} {error_text(error.read())}")
+        except (OSError, TimeoutError) as error:
+            if deadline is not None and time.monotonic() >= deadline - 0.05:
+                raise Failure(f"opencode did not answer within {TURN_TIMEOUT} s")
+            raise Failure(last_line(list(self.stderr)) or f"opencode stopped answering: {error}")
+        return json.loads(data) if data else {}
+
+    def close(self):
+        if self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                self.proc.kill()
+                self.proc.wait()
+
+
+def error_text(raw):
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw.decode(errors="replace")[:200]
+    return str(data.get("message") or data.get("error") or data)[:200] if isinstance(data, dict) else str(data)[:200]
+
+
+def pick_model(server, name, fast):
+    """The model to run, with its lowest reasoning variant."""
+    provider, _, model_id = name.partition("/")
+    models = {}
+    # The login is read while the server starts, so a model can appear late.
+    for attempt in range(10):
+        models = {(m.get("providerID"), m.get("id")): m for m in server.call("GET", "/api/model").get("data", [])}
+        if (provider, model_id) in models:
+            break
+        time.sleep(0.3)
+    model = models.get((provider, model_id))
+    if not model:
+        raise Failure(f"opencode has no model {name}; log in to its provider with: opencode auth login")
+    if fast and (provider, model_id + "-fast") in models:
+        model = models[(provider, model_id + "-fast")]
+    variants = [v.get("id") for v in model.get("variants") or []]
+    ref = {"providerID": provider, "id": model["id"]}
+    variant = next((effort for effort in EFFORTS if effort in variants), None)
+    if variant:
+        ref["variant"] = variant
+    return ref
+
+
+def clean_up(server):
+    """Deletes rewrites a killed bridge left in the user's database."""
+    cutoff = time.time() - TURN_TIMEOUT - 30
+    try:
+        sessions = server.call("GET", "/api/session").get("data", [])
+    except Failure:
+        return
+    for session in sessions:
+        created = (session.get("time") or {}).get("created") or 0
+        if (session.get("agent") == "rewrite" and session.get("title") == TITLE
+                and (session.get("location") or {}).get("directory") == str(WORK_DIR)
+                and created / 1000 < cutoff):
+            try:
+                server.call("DELETE", f"/api/session/{session['id']}")
+            except Failure:
+                pass
+
+
+def run(server, model, content, deadline):
+    """One session: the answer and the guard's verdict on its request."""
+    session = server.call("POST", "/api/session", {
+        "agent": "rewrite", "title": TITLE, "model": model,
+        "location": {"directory": str(WORK_DIR)},
+    }, deadline)["data"]["id"]
+    try:
+        server.call("POST", f"/api/session/{session}/prompt", {"text": content}, deadline)
+        server.call("POST", f"/api/experimental/session/{session}/wait", None, deadline)
+        messages = server.call("GET", f"/api/session/{session}/message?type=assistant&order=asc",
+                               None, deadline).get("data", [])
+        return session, messages
+    finally:
+        try:
+            server.call("POST", f"/api/session/{session}/interrupt")
+        except Failure:
+            pass
+        try:
+            server.call("DELETE", f"/api/session/{session}")
+        except Failure:
+            pass
+
+
+def guard_verdict(status, session):
+    try:
+        verdict = json.loads(status.read_text())
+    except (OSError, ValueError):
+        return None
+    return verdict if verdict.get("sessionID") == session else None
+
+
+def check_guard(server, model, status):
+    deadline = time.monotonic() + 30
+    session, messages = run(server, model, PROBE, deadline)
+    verdict = guard_verdict(status, session)
+    if messages or verdict is None:
+        raise Failure("opencode did not load AI Edit's guard; AI Edit does not send it text")
+    if verdict["refused"]:
+        raise Failure(f"opencode would send {verdict['refused']} with the text; AI Edit does not support this version yet")
+
+
+def turn(server, model, content, status):
+    deadline = time.monotonic() + TURN_TIMEOUT
+    session, messages = run(server, model, content, deadline)
+    verdict = guard_verdict(status, session)
+    if verdict and verdict["refused"]:
+        raise Failure(f"opencode would send {verdict['refused']} with the text; AI Edit refused it")
+    if not messages:
+        raise Failure("opencode returned nothing")
+    answer = messages[-1]
+    if answer.get("error"):
+        raise Failure(error_text(json.dumps(answer["error"]).encode()))
+    parts = answer.get("content") or []
+    for part in parts:
+        if part.get("type") not in ("text", "reasoning"):
+            raise Failure(f"opencode tried to use {part.get('type')}")
+    return "".join(part.get("text", "") for part in parts if part.get("type") == "text")
+
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="One opencode rewrite behind claude's stream-json protocol.")
+    parser.add_argument("model")
+    parser.add_argument("--fast", action="store_true")
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+    server = None
+    status = HOME / f"guard-{os.getpid()}.json"
+    try:
+        if "/" not in args.model:
+            raise Failure(f"{args.model} is not an opencode model: write provider/model")
+        system_prompt = SYSTEM_PROMPT_FILE.read_text().strip()
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        opencode = opencode_binary()
+        config_dir = prepare_home()
+        server = Server(opencode, environment(config_dir, system_prompt, secrets.token_hex(16), status))
+        model = pick_model(server, args.model, args.fast)
+        check_guard(server, model, status)
+        clean_up(server)
+
+        line = sys.stdin.readline()
+        if not line:
+            return 0
+        try:
+            content = json.loads(line)["message"]["content"][0]["text"]
+        except (ValueError, LookupError, TypeError):
+            raise Failure("the request is not a claude user message")
+        result = turn(server, model, content, status)
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": result})
+        return 0
+    except Failure as failure:
+        emit({"type": "result", "subtype": "error", "is_error": True, "result": str(failure)})
+        print(failure, file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if server:
+            server.close()
+        status.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

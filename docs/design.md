@@ -72,6 +72,8 @@ Three parts, each testable from a terminal without the shell:
   terminal.
 - `bin/ai-edit-codex`: Codex behind claude's stream-json protocol, so the
   pool and `ai-edit-agent` treat both agents alike (see Codex backend).
+  `bin/ai-edit-opencode` does the same for opencode, with
+  `lib/opencode-guard.ts` loaded into its server (see opencode backend).
 - `AiEdit.qml` plus `components/`: the overlay. Draws only; every action is a
   call into `bin/ai-edit` or the service.
 
@@ -441,13 +443,64 @@ tightly than Codex's and checked before sending. It brings nothing Codex
 does not already give AI Edit on the same subscription, costs more memory,
 and cannot keep the text off disk with a subscription login. Not worth
 building now; it would become interesting for API-key use (any provider,
-in memory) or for models only opencode reaches.
+in memory) or for models only opencode reaches. Paul chose to build it the
+same day, opt-in; see the next section.
 
 Open risks: the plugin API (`context`, `http.request`) is v2 and new, and
 the guard must fail closed if it ever stops loading; Fast is requested
 (`service_tier: priority`) and was faster, yet the response reported the
 `default` tier; the two outliers; and the token-sharing route's limits
 (`subscription_sharing_*` errors) are separate from Codex's.
+
+### opencode backend (October 16, 2026)
+
+`agent = "opencode"` with a `provider/model` (default `openai/gpt-6.1-sol`).
+It is never picked automatically, because of the database below: the README
+says so where it explains what happens to the text, and AGENTS.md records it
+as the one exception to the rule that text stays in `$XDG_RUNTIME_DIR`. Any
+model opencode is logged in to works, since the guard sits before the
+provider; only GPT-6.1 Sol is measured.
+
+`bin/ai-edit-opencode` is a bridge like `ai-edit-codex`: it starts
+`opencode serve --stdio` on localhost with a random password, waits for one
+claude stream-json message, runs it as one session (create, prompt, wait,
+read, delete) and answers with a claude result event, so Service.qml and
+`ai-edit-agent` only needed the command. `--fast` picks the model's `-fast`
+variant when opencode has one; effort is the lowest variant offered (`none`,
+`minimal` or `low`). Every rewrite starts a server, as with Codex, which
+keeps the pool unchanged; one long-lived server with a session per rewrite
+would save the start but needs a pool of its own. A waiting bridge holds
+about 315 MB RSS: the server grows from 157 to 285 MB once the probe below
+has loaded the provider code, and the bridge is 31 MB.
+
+Isolation without touching the XDG directories: under mise, `opencode` is a
+wrapper that runs mise, which reads them too. `OPENCODE_CONFIG_DIR` points at
+`$XDG_RUNTIME_DIR/ai-edit/opencode/config`, holding only the guard; every
+other `OPENCODE_*` variable of the user is dropped except `OPENCODE_DB`.
+Checked live with a plugin and an AGENTS.md in the user's config directory:
+a plain server loaded the plugin, which saw the request; the bridge's did
+not. Settings come in `OPENCODE_CONFIG_CONTENT` as in the research above.
+
+`lib/opencode-guard.ts` is the `context` hook from the research: only AI
+Edit's prompt stays in the system part, and a request with tools, other
+messages, another agent or another prompt throws, which sends nothing. It
+writes its verdict, without the text, to a status file the bridge names.
+Before a server is used the bridge sends a probe text; the guard checks it
+and throws, so the check costs no request. No verdict, or an answer to the
+probe, means the guard is not loaded and the bridge refuses to start. A
+refusal on a real rewrite reaches the overlay as an error. The guard depends
+on opencode's v2 plugin API; the probe makes a change there fail closed.
+
+The database, measured with a synthetic marker in the user's `opencode.db`:
+13 copies in the WAL after the turn, 15 after deleting the session (rows
+gone, bytes not), and after a checkpoint none in the WAL but 3 in free pages
+of the main file, in no live row. opencode deletes without `secure_delete`,
+so the text stays until SQLite reuses those pages. `VACUUM` after each
+rewrite would remove it but rewrites the user's whole database while their
+own opencode may be using it; deleting the rows ourselves with
+`secure_delete` would bypass opencode's schema. Neither is done. A bridge
+killed during a turn leaves its session; the next bridge deletes rewrite
+sessions in AI Edit's working directory older than a turn can last.
 
 ### Capture and insert (measured)
 

@@ -18,9 +18,9 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ai-edit"
 SETTINGS = ("agent", "model", "fast", "preview", "compact", "width", "backend", "idle_timeout")
-AGENTS = ("claude", "codex")
+AGENTS = ("claude", "codex", "opencode")
 # The model an agent uses when the config names none.
-MODELS = {"claude": "sonnet", "codex": "gpt-6.1-sol"}
+MODELS = {"claude": "sonnet", "codex": "gpt-6.1-sol", "opencode": "openai/gpt-6.1-sol"}
 CLAUDE_MODELS = ("sonnet", "haiku", "opus")
 
 
@@ -39,14 +39,21 @@ def load(path):
 
 
 def default_agent():
-    """Claude when it is installed, being the faster; else Codex when that is."""
+    """Claude when it is installed, being the faster; else Codex when that is.
+
+    Never opencode: it keeps the text in its database for a while, so it is
+    only used when the config asks for it.
+    """
     if not shutil.which("claude") and shutil.which("codex"):
         return "codex"
     return "claude"
 
 
 def check_model(where, agent, model):
-    # A config written for one agent names models the other does not know.
+    # A config written for one agent names models the others do not know.
+    if ("/" in model) != (agent == "opencode"):
+        raise ConfigError(f"{where}: {model} is not a model for {agent}"
+                          + (", write provider/model" if agent == "opencode" else ""))
     claude = model in CLAUDE_MODELS or model.startswith("claude")
     if claude != (agent == "claude") and (claude or model.startswith("gpt-")):
         raise ConfigError(f"{where}: {model} is not a model for {agent}")
@@ -65,7 +72,7 @@ def is_text(value):
 
 
 CHECKS = {
-    "agent": (lambda v: v in AGENTS, "claude or codex"),
+    "agent": (lambda v: v in AGENTS, "claude, codex or opencode"),
     "fast": (lambda v: isinstance(v, bool), "true or false"),
     "model": (is_text, "a model name such as \"sonnet\""),
     "preview": (lambda v: isinstance(v, bool), "true or false"),

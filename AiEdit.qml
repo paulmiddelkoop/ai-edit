@@ -292,15 +292,16 @@ Item {
   }
 
   function hint(message) {
-    var codex = root.config.agent === "codex"
-    var name = codex ? "Codex" : "Claude Code"
-    var command = codex ? "codex" : "claude"
-    if (/usage limit|rate limit|limit reached/i.test(message))
-      return "The " + (codex ? "Codex" : "Claude") + " usage limit is reached. Try again later."
+    var agent = ["codex", "opencode"].indexOf(root.config.agent) >= 0 ? root.config.agent : "claude"
+    var name = { claude: "Claude Code", codex: "Codex", opencode: "opencode" }[agent]
+    var command = agent
+    var login = agent === "opencode" ? "opencode auth login" : agent
+    if (/usage.limit|rate.limit|limit reached/i.test(message))
+      return "The " + (agent === "claude" ? "Claude" : name) + " usage limit is reached. Try again later."
     if (/not installed/i.test(message))
-      return "Install " + name + " and log in with: " + command
+      return "Install " + name + " and log in with: " + login
     if (/log ?in|auth|credential|401/i.test(message))
-      return "Log in to " + name + " with: " + command
+      return "Log in to " + name + " with: " + login
     if (/did not answer|exited|could not be started|still starting/i.test(message))
       return "Check that " + name + " works: run " + command + " in a terminal"
     return ""

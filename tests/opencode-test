@@ -1,0 +1,95 @@
+#!/bin/bash
+# Runs bin/ai-edit-agent with agent opencode against tests/fake-opencode: the
+# separate configuration, the guard check, answers, failures and clean-up.
+set -uo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export XDG_RUNTIME_DIR=$tmp/run XDG_STATE_HOME=$tmp/state XDG_CONFIG_HOME=$tmp/config
+export AI_EDIT_OPENCODE=$root/tests/fake-opencode AI_EDIT_TURN_TIMEOUT=2
+export OPENCODE_DB=$tmp/user.db OPENCODE_CONFIG=$tmp/user-config.json
+export FAKE_OPENCODE_LOG=$tmp/opencode.log
+home=$XDG_RUNTIME_DIR/ai-edit/opencode
+mkdir -p "$XDG_RUNTIME_DIR"
+failures=0
+
+ask() {
+  jq -cn --arg instruction "$1" --arg text "$2" --argjson fast "${3:-false}" --arg model "${4:-openai/gpt-test}" \
+    '{agent: "opencode", model: $model, fast: $fast, instruction: $instruction, text: $text}' |
+    "$root/bin/ai-edit-agent"
+}
+
+expect() {
+  local name="$1" want="$2" got="$3"
+  if [[ $got == "$want" ]]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: wanted $want, got $got"
+    failures=$((failures + 1))
+  fi
+}
+
+started() { jq -c "select(.start) | $1" "$FAKE_OPENCODE_LOG" | tail -1; }
+
+expect "answer" '{"text": "HELLO"}' "$(ask echo hello)"
+expect "padding kept" '{"text": "\n  HELLO WORLD\n"}' "$(ask echo $'\n  hello world\n')"
+expect "lowest effort" '{"text": "gpt-test none"}' "$(ask tier hi)"
+expect "fast picks the fast model" '{"text": "gpt-test-fast low"}' "$(ask tier hi true)"
+expect "no effort when a model has none" '{"text": "plain -"}' "$(ask tier hi false local/plain)"
+expect "error result" '{"error": "You'"'"'ve hit your usage limit."}' "$(ask fail hi)"
+expect "dead server" '{"error": "opencode stopped answering: Remote end closed connection without response"}' \
+  "$(ask die hi)"
+expect "timeout" '{"error": "opencode did not answer within 2 s"}' "$(ask hang hi)"
+expect "no tools" '{"error": "opencode tried to use tool"}' "$(ask tool hi)"
+expect "unknown model" '{"error": "opencode has no model openai/none; log in to its provider with: opencode auth login"}' \
+  "$(AI_EDIT_TURN_TIMEOUT=10 ask echo hi false openai/none)"
+expect "provider/model" '{"error": "gpt-test is not an opencode model: write provider/model"}' \
+  "$(ask echo hi false gpt-test)"
+
+expect "own configuration directory" "\"$home/config\"" "$(started .config_dir)"
+expect "the guard is installed" "" "$(diff "$root/lib/opencode-guard.ts" "$home/config/plugins/ai-edit-guard.ts")"
+expect "only the guard is configured" "ai-edit-guard.ts" "$(ls "$home/config/plugins")"
+expect "the user's database, none of their opencode settings" \
+  '["OPENCODE_CONFIG_CONTENT","OPENCODE_CONFIG_DIR","OPENCODE_DB","OPENCODE_DISABLE_AUTOUPDATE","OPENCODE_DISABLE_CLAUDE_CODE","OPENCODE_DISABLE_PROJECT_CONFIG"]' \
+  "$(started .opencode_env)"
+expect "a rewrite agent with AI Edit's prompt and no tools" true "$(jq --rawfile prompt "$root/system-prompt.txt" \
+  'select(.start) | .settings.agents.rewrite | .system == ($prompt | rtrimstr("\n"))
+  and .permissions == [{action: "*", resource: "*", effect: "deny"}]' "$FAKE_OPENCODE_LOG" | sort -u)"
+expect "runs in the agent directory" "\"$XDG_STATE_HOME/ai-edit/agent\"" "$(started .cwd)"
+expect "sessions are deleted, except under a dead server or a killed bridge" '["die","hang"]' \
+  "$(jq -c '[.[].prompt | split("\n")[0]] | sort' "$OPENCODE_DB")"
+expect "probes and rewrites are deleted" "false true" "$(jq -r 'select(.deleted) | .probe' "$FAKE_OPENCODE_LOG" | sort -u | xargs)"
+
+expect "a guard that is not loaded is refused" '{"error": "opencode did not load AI Edit'"'"'s guard; AI Edit does not send it text"}' \
+  "$(FAKE_OPENCODE_UNGUARDED=1 ask echo hi)"
+expect "a guard that refuses stops the server's use" \
+  '{"error": "opencode would send tools with the text; AI Edit does not support this version yet"}' \
+  "$(FAKE_OPENCODE_LEAK=tools ask echo hi)"
+
+# A rewrite a killed bridge left behind: deleted once older than a turn can last.
+now=$(date +%s%3N)
+jq -n --arg dir "$XDG_STATE_HOME/ai-edit/agent" --argjson now "$now" '{
+  old: {id: "old", agent: "rewrite", title: "AI Edit", location: {directory: $dir}, time: {created: ($now - 600000)}},
+  busy: {id: "busy", agent: "rewrite", title: "AI Edit", location: {directory: $dir}, time: {created: $now}},
+  mine: {id: "mine", agent: "build", title: "AI Edit", location: {directory: $dir}, time: {created: 0}}}' >"$OPENCODE_DB"
+ask echo hi >/dev/null
+expect "left-over rewrites are cleaned up, others kept" '["busy","mine"]' "$(jq -c 'keys' "$OPENCODE_DB")"
+echo '{}' >"$OPENCODE_DB"
+
+# The overlay's way in: a waiting bridge whose stdin closes, or that is killed.
+"$root/bin/ai-edit-opencode" openai/gpt-test </dev/null >/dev/null
+expect "a bridge without a request ends" 0 "$?"
+sleep 30 | "$root/bin/ai-edit-opencode" openai/gpt-test &
+bridge=$!
+sleep 1
+kill -9 "$bridge"
+sleep 0.5
+expect "no stray processes" 0 "$(pgrep -fc "$AI_EDIT_OPENCODE")"
+
+# End to end through bin/ai-edit.
+mkdir -p "$XDG_CONFIG_HOME/ai-edit"
+printf 'agent = "opencode"\nmodel = "openai/gpt-test"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+expect "custom instruction" "HELLO THERE" "$(printf 'hello there' | AI_EDIT_INSTRUCTION=echo "$root/bin/ai-edit" run -)"
+
+((failures == 0)) || exit 1

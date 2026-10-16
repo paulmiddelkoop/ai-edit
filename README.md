@@ -30,6 +30,7 @@ Run `claude` or `codex` once if you haven't signed in yet.
 | --- | --- | --- | --- |
 | Claude Code | by default | Sonnet (`sonnet`) | about 1.3 s |
 | Codex | when Claude Code is not installed, or with `agent = "codex"` | GPT-6.1 Sol in Fast mode (`gpt-6.1-sol`) | about 2.7 s, 3.2 s without Fast |
+| opencode | only with `agent = "opencode"`; see [what happens to your text](#what-happens-to-your-text) | GPT-6.1 Sol in Fast mode (`openai/gpt-6.1-sol`) | about 2.7 s, 3.2 s without Fast |
 
 Times are for a sentence or a short email, from choosing the action to the
 result, measured in October 2026; they vary with the provider's load. Other
@@ -126,13 +127,13 @@ open AI Edit.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `agent` | `claude` | The coding agent that rewrites: `claude` or `codex`. Left out, Claude Code, or Codex when only that is installed. |
-| `model` | per agent | Model for actions that don't name one. Claude: `sonnet` (default), `haiku` or `opus`. Codex: `gpt-6.1-sol` (default) or another model `codex` lists. |
-| `fast` | `true` | Codex only: Fast mode, about half a second quicker per rewrite, at the cost of more of your plan's usage. |
+| `agent` | `claude` | The coding agent that rewrites: `claude`, `codex` or `opencode`. Left out, Claude Code, or Codex when only that is installed; opencode only when you name it. |
+| `model` | per agent | Model for actions that don't name one. Claude: `sonnet` (default), `haiku` or `opus`. Codex: `gpt-6.1-sol` (default) or another model `codex` lists. opencode: `openai/gpt-6.1-sol` (default) or another `provider/model` that `opencode models` lists; only GPT-6.1 Sol is tested. |
+| `fast` | `true` | Codex, and opencode models with a `-fast` variant: Fast mode, about half a second quicker per rewrite, at the cost of more of your plan's usage. |
 | `preview` | `true` | Show the result before pasting it. Shift with the letter does the opposite. |
 | `compact` | `false` | Hide the action list and key hints; the letters keep working and **?** shows them. |
 | `width` | `560` | Width of the overlay in pixels, about 56 characters per line. Try `720` if you often edit long emails. |
-| `idle_timeout` | `30` | Minutes without a rewrite before the waiting agent process stops to free its memory (about 170 MB per model for Claude, 120 MB for Codex). The next rewrite then takes a few seconds longer. `0` keeps it ready all the time. |
+| `idle_timeout` | `30` | Minutes without a rewrite before the waiting agent process stops to free its memory (about 170 MB per model for Claude, 120 MB for Codex, 300 MB for opencode). The next rewrite then takes a few seconds longer. `0` keeps it ready all the time. |
 
 ### Your own actions
 
@@ -167,6 +168,16 @@ session. Codex runs in a separate home in your runtime directory that shares
 only your login, so your Codex instructions, skills and plugins stay out of
 the request; AI Edit checks this before each new Codex version is used.
 
+opencode is opt-in because it cannot keep your text off disk: it stores every
+conversation in its database (`~/.local/share/opencode/opencode.db`), in the
+same file as your login. AI Edit deletes each rewrite's session as soon as
+it is done, but SQLite can keep the deleted text in that file until it
+reuses the space, which may take days; mind this if you back up or sync that
+directory. Your opencode settings, instructions, agents, skills and plugins
+stay out: AI Edit gives the server a configuration of its own, with a check
+that lets only the rewrite instruction and your text out, without tools,
+whatever provider the model is from.
+
 Locally, text stays in your private runtime directory, never in command-line
 arguments or AI Edit logs. AI Edit restores the clipboard after capturing
 and pasting, and marks pasted results as sensitive so Omarchy's clipboard
@@ -188,12 +199,13 @@ To run the tests without a compositor or agent requests:
 bin/ai-edit selftest
 tests/claude-test
 tests/codex-test
+tests/opencode-test
 ```
 
 ## Roadmap
 
 - **More coding agents.** The other agents Omarchy can set up, beyond Claude
-  Code and Codex.
+  Code, Codex and opencode.
 - **An API key instead of a coding agent**, such as an Anthropic or OpenAI
   key, if people want it. Open an issue if you would use it.
 

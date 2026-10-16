@@ -5,8 +5,8 @@ Reads one request {"agent", "model", "fast", "instruction", "text"} on stdin
 and prints {"text": ...} or {"error": ...}. bin/ai-edit run uses it from a
 terminal; the overlay goes through Service.qml instead, which keeps the agent
 waiting. The two speak the same protocol: keep user_message, extract_answer
-and split_padding in step with Service.qml. Codex speaks it through
-bin/ai-edit-codex.
+and split_padding in step with Service.qml. Codex and opencode speak it
+through bin/ai-edit-codex and bin/ai-edit-opencode.
 """
 
 import json
@@ -27,7 +27,7 @@ TURN_TIMEOUT = int(os.environ.get("AI_EDIT_TURN_TIMEOUT", "60"))
 MAX_REQUEST = 4 * 1024 * 1024
 WORK_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "ai-edit/agent"
 DEFAULT_MODEL = "sonnet"
-AGENTS = ("claude", "codex")
+AGENTS = ("claude", "codex", "opencode")
 
 
 class TurnError(Exception):
@@ -35,8 +35,8 @@ class TurnError(Exception):
 
 
 def agent_command(agent, model, fast):
-    if agent == "codex":
-        return [str(PLUGIN_DIR / "bin/ai-edit-codex"), model] + (["--fast"] if fast else [])
+    if agent in ("codex", "opencode"):
+        return [str(PLUGIN_DIR / f"bin/ai-edit-{agent}"), model] + (["--fast"] if fast else [])
     claude = os.environ.get("AI_EDIT_CLAUDE") or shutil.which("claude")
     if not claude:
         raise TurnError("claude is not installed")

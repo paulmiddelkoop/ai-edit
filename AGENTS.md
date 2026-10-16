@@ -16,11 +16,14 @@ design, the measurements behind it and the open points; read it first.
 - Check QML with `qmllint` only. Do not start `qml`, `qmlscene` or a second
   `quickshell` to try it out: they abort without the shell's environment,
   and each abort is a crash notification on the desktop.
-- Run `bin/ai-edit selftest`, `tests/claude-test` and `tests/codex-test` before
-  committing; they need no compositor and make no agent requests.
+- Run `bin/ai-edit selftest`, `tests/claude-test`, `tests/codex-test` and
+  `tests/opencode-test` before committing; they need no compositor and make
+  no agent requests.
 - Text captured from the screen is untrusted and may be large or secret: never
   pass it as a command-line argument, never log it, and keep it in
-  `$XDG_RUNTIME_DIR` only.
+  `$XDG_RUNTIME_DIR` only. The one exception is the opt-in opencode agent,
+  whose database keeps it on disk for a while (see the README); do not
+  extend it to other paths.
 - Only add a comment when it says something the code cannot: a hidden
   constraint, an invariant, a workaround.
 - If `AGENTS.local.md` exists next to this file, read and follow it too: it

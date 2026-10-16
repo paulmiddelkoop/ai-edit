@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Stands in for `opencode serve --stdio`: the HTTP API AI Edit uses.
+
+The instruction in a prompt picks the behaviour, as in fake-claude. The guard
+is played here: with the guard file in the config directory, a probe gets no
+answer and each request's verdict goes to AI_EDIT_GUARD_STATUS.
+FAKE_OPENCODE_LEAK makes that verdict a refusal and FAKE_OPENCODE_UNGUARDED
+plays a guard that did not load; sessions are kept in
+OPENCODE_DB (a JSON file here), and FAKE_OPENCODE_LOG gets one line per start
+with the configuration and one per deleted session.
+"""
+import base64
+import json
+import os
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ENV = dict(os.environ)
+PASSWORD = ENV.pop("OPENCODE_PASSWORD", "")
+DB = Path(ENV.get("OPENCODE_DB") or "/nonexistent")
+GUARDED = ((Path(ENV.get("OPENCODE_CONFIG_DIR", "/nonexistent")) / "plugins/ai-edit-guard.ts").is_file()
+           and not ENV.get("FAKE_OPENCODE_UNGUARDED"))
+MODELS = [
+    {"providerID": "openai", "id": "gpt-test", "variants": [{"id": "none"}, {"id": "low"}]},
+    {"providerID": "openai", "id": "gpt-test-fast", "variants": [{"id": "low"}]},
+    {"providerID": "local", "id": "plain", "variants": []},
+]
+lock = threading.Lock()
+
+
+def log(entry):
+    if ENV.get("FAKE_OPENCODE_LOG"):
+        with open(ENV["FAKE_OPENCODE_LOG"], "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def load():
+    try:
+        return json.loads(DB.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save(sessions):
+    DB.write_text(json.dumps(sessions))
+
+
+def answer(session, text):
+    instruction, _, rest = text.partition("\n\n")
+    inner = rest.removeprefix("<text>\n").removesuffix("\n</text>")
+    model = session["model"]
+    if instruction == "fail":
+        return {"type": "assistant", "content": [], "error": {"message": "You've hit your usage limit."}}
+    if instruction == "tool":
+        return {"type": "assistant", "content": [{"type": "tool", "name": "bash"}], "finish": "tool-calls"}
+    if instruction == "tier":
+        reply = f"{model['id']} {model.get('variant', '-')}"
+    else:
+        reply = inner.upper()
+    return {"type": "assistant", "content": [{"type": "reasoning", "text": "hm"},
+                                             {"type": "text", "text": f"<rewrite>\n{reply}\n</rewrite>"}],
+            "finish": "stop"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, status, body=None):
+        data = b"" if body is None else json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(length)) if length else {}
+
+    def authorized(self):
+        expected = "Basic " + base64.b64encode(f"opencode:{PASSWORD}".encode()).decode()
+        if self.headers.get("Authorization") != expected:
+            self.reply(401, {"message": "unauthorized"})
+            return False
+        return True
+
+    def do_GET(self):
+        if not self.authorized():
+            return
+        path = self.path.split("?")[0]
+        parts = path.strip("/").split("/")
+        if path == "/api/model":
+            return self.reply(200, {"data": MODELS})
+        if path == "/api/session":
+            return self.reply(200, {"data": list(load().values())})
+        if parts[:2] == ["api", "session"] and parts[3:] == ["message"]:
+            session = load().get(parts[2])
+            return self.reply(404 if session is None else 200, {"data": (session or {}).get("messages", [])})
+        self.reply(404, {"message": "not found"})
+
+    def do_POST(self):
+        if not self.authorized():
+            return
+        body = self.body()
+        parts = self.path.split("?")[0].strip("/").split("/")
+        with lock:
+            sessions = load()
+            if parts == ["api", "session"]:
+                session = dict(body, id=f"ses_{time.monotonic_ns()}",
+                               time={"created": int(time.time() * 1000)}, messages=[])
+                sessions[session["id"]] = session
+                save(sessions)
+                return self.reply(200, {"data": {k: v for k, v in session.items() if k != "messages"}})
+            session = sessions.get(parts[parts.index("session") + 1])
+            if session is None:
+                return self.reply(404, {"message": "no such session"})
+            if parts[-1] == "prompt":
+                session["prompt"] = body["text"]
+                save(sessions)
+                return self.reply(200, {"data": {"type": "user"}})
+            if parts[-1] == "interrupt":
+                return self.reply(204)
+        if parts[-1] == "wait":
+            text = session.get("prompt", "")
+            if text.startswith("die\n"):
+                os._exit(3)
+            if text.startswith("hang\n"):
+                time.sleep(3600)
+            if GUARDED:
+                refused = ENV.get("FAKE_OPENCODE_LEAK") or None
+                Path(ENV["AI_EDIT_GUARD_STATUS"]).write_text(
+                    json.dumps({"sessionID": session["id"], "refused": refused}))
+                if refused or text == ENV.get("AI_EDIT_PROBE"):
+                    return self.reply(204)
+            with lock:
+                sessions = load()
+                sessions[session["id"]]["messages"] = [answer(session, text)]
+                save(sessions)
+            return self.reply(204)
+        self.reply(404, {"message": "not found"})
+
+    def do_DELETE(self):
+        if not self.authorized():
+            return
+        parts = self.path.strip("/").split("/")
+        with lock:
+            sessions = load()
+            gone = sessions.pop(parts[2], None)
+            save(sessions)
+        if gone:
+            log({"deleted": gone["id"], "probe": gone.get("prompt") == ENV.get("AI_EDIT_PROBE")})
+        self.reply(204 if gone else 404)
+
+
+if sys.argv[1:3] != ["serve", "--stdio"]:
+    sys.exit(f"fake opencode does not do {sys.argv[1:]}")
+log({"start": sys.argv[1:], "config_dir": ENV.get("OPENCODE_CONFIG_DIR"),
+     "settings": json.loads(ENV.get("OPENCODE_CONFIG_CONTENT", "{}")),
+     "opencode_env": sorted(k for k in ENV if k.startswith("OPENCODE_")), "cwd": os.getcwd()})
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+print(json.dumps({"url": f"http://127.0.0.1:{server.server_address[1]}"}), flush=True)
+sys.stdin.read()

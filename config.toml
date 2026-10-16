@@ -2,14 +2,17 @@
 # copy it to ~/.config/ai-edit/config.toml and edit the copy. Settings you
 # leave out keep these values. Actions you list replace these as a whole.
 
-# The coding agent that rewrites: claude or codex. Left out, AI Edit uses
-# Claude Code, which is the faster, and Codex when only that is installed.
+# The coding agent that rewrites: claude, codex or opencode. Left out, AI
+# Edit uses Claude Code, which is the faster, and Codex when only that is
+# installed. opencode only when named: it keeps the text in its database for
+# a while (see the README).
 # agent = "codex"
 # Model for actions that do not name one. Left out: sonnet for Claude (haiku
-# and opus work too), gpt-6.1-sol for Codex (any model codex lists).
+# and opus work too), gpt-6.1-sol for Codex (any model codex lists),
+# openai/gpt-6.1-sol for opencode (any provider/model opencode lists).
 # model = "sonnet"
-# Codex only: Fast mode, about half a second quicker per rewrite, at the cost
-# of more of your plan's usage.
+# Codex, and opencode models with a -fast variant: Fast mode, about half a
+# second quicker per rewrite, at the cost of more of your plan's usage.
 fast = true
 # Show the result before pasting it; Shift with the letter does the opposite.
 preview = true

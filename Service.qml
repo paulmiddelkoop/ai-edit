@@ -7,8 +7,9 @@ import Quickshell.Io
 // once, so no conversation builds up. The overlay calls rewrite().
 //
 // bin/ai-edit-agent speaks the same protocol for `ai-edit run`: keep
-// userMessage, extractAnswer and the padding in step with it. Codex speaks
-// claude's protocol through bin/ai-edit-codex.
+// userMessage, extractAnswer and the padding in step with it. Codex and
+// opencode speak claude's protocol through bin/ai-edit-codex and
+// bin/ai-edit-opencode.
 Item {
   id: root
 
@@ -235,8 +236,8 @@ Item {
         }
       }
 
-      command: proc.agent === "codex"
-        ? [root.pluginDir + "/bin/ai-edit-codex", proc.model].concat(proc.fast ? ["--fast"] : [])
+      command: proc.agent === "codex" || proc.agent === "opencode"
+        ? [root.pluginDir + "/bin/ai-edit-" + proc.agent, proc.model].concat(proc.fast ? ["--fast"] : [])
         : ["claude", "-p",
           "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
           "--no-session-persistence",

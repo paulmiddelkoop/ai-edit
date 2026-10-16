@@ -740,16 +740,19 @@ TOML
   check "a broken config is an error that says why" broken_config
   agent_choice() (
     export XDG_CONFIG_HOME=$STATE_DIR/agent
-    mkdir -p "$XDG_CONFIG_HOME/ai-edit" "$STATE_DIR/both" "$STATE_DIR/codex-only" "$STATE_DIR/neither"
-    for agent in claude codex; do
+    mkdir -p "$XDG_CONFIG_HOME/ai-edit" "$STATE_DIR/both" "$STATE_DIR/codex-only" "$STATE_DIR/opencode-only" \
+      "$STATE_DIR/neither"
+    for agent in claude codex opencode; do
       printf '#!/bin/sh\n' >"$STATE_DIR/both/$agent"
     done
     cp "$STATE_DIR/both/codex" "$STATE_DIR/codex-only/codex"
-    chmod +x "$STATE_DIR"/both/* "$STATE_DIR"/codex-only/*
+    cp "$STATE_DIR/both/opencode" "$STATE_DIR/opencode-only/opencode"
+    chmod +x "$STATE_DIR"/both/* "$STATE_DIR"/codex-only/* "$STATE_DIR"/opencode-only/*
     found() { PATH=$STATE_DIR/$1:$(dirname "$(command -v python3)") config; }
     found both | jq -e '.agent == "claude" and .model == "sonnet"' >/dev/null || exit 1
     found codex-only | jq -e '.agent == "codex" and .model == "gpt-6.1-sol" and .fast' >/dev/null || exit 1
     found neither | jq -e '.agent == "claude"' >/dev/null || exit 1
+    found opencode-only | jq -e '.agent == "claude"' >/dev/null || exit 1
     printf 'agent = "codex"\nfast = false\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
     found both | jq -e '.agent == "codex" and (.fast | not)' >/dev/null || exit 1
     actions | jq -e 'all(.[]; .model == "gpt-6.1-sol")' >/dev/null || exit 1
@@ -758,10 +761,16 @@ TOML
     printf 'agent = "codex"\n[[action]]\nkey = "a"\nlabel = "A"\ninstruction = "x"\nmodel = "opus"\n' \
       >"$XDG_CONFIG_HOME/ai-edit/config.toml"
     [[ $(actions 2>&1) == *"opus is not a model for codex"* ]] || exit 1
+    printf 'agent = "opencode"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    found both | jq -e '.agent == "opencode" and .model == "openai/gpt-6.1-sol"' >/dev/null || exit 1
+    printf 'agent = "opencode"\nmodel = "gpt-6.1-sol"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    [[ $(config 2>&1) == *"gpt-6.1-sol is not a model for opencode, write provider/model"* ]] || exit 1
+    printf 'agent = "codex"\nmodel = "openai/gpt-6.1-sol"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    [[ $(config 2>&1) == *"openai/gpt-6.1-sol is not a model for codex"* ]] || exit 1
     printf 'agent = "pi"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
-    [[ $(config 2>&1) == *"agent must be claude or codex"* ]]
+    [[ $(config 2>&1) == *"agent must be claude, codex or opencode"* ]]
   )
-  check "Claude by default, Codex without it, unless the config names one" agent_choice
+  check "Claude by default, Codex without it, opencode only when the config names it" agent_choice
   action_ids() (
     export XDG_CONFIG_HOME=$STATE_DIR/ids
     mkdir -p "$XDG_CONFIG_HOME/ai-edit"
