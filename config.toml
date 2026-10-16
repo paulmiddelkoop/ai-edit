@@ -2,16 +2,24 @@
 # copy it to ~/.config/ai-edit/config.toml and edit the copy. Settings you
 # leave out keep these values. Actions you list replace these as a whole.
 
-# Claude model for actions that do not name one: sonnet, haiku or opus.
-model = "sonnet"
+# The coding agent that rewrites: claude or codex. Left out, AI Edit follows
+# the agent Omarchy is set to (omarchy default agent), or claude when that is
+# one AI Edit does not support.
+# agent = "codex"
+# Model for actions that do not name one. Left out: sonnet for Claude (haiku
+# and opus work too), gpt-6.1-sol for Codex (any model codex lists).
+# model = "sonnet"
+# Codex only: Fast mode, about half a second quicker per rewrite, at the cost
+# of more of your plan's usage.
+fast = true
 # Show the result before pasting it; Shift with the letter does the opposite.
 preview = true
 # Show only the text; the letters keep working and ? shows the actions.
 compact = false
 # Width of the overlay.
 width = 560
-# Minutes without using AI Edit after which the Claude process kept ready is
-# stopped to free its memory (about 170 MB per model). The next rewrite then
+# Minutes without using AI Edit after which the agent process kept ready is
+# stopped to free its memory (about 170 MB per model for Claude). The next rewrite then
 # takes a few seconds longer. 0 keeps it ready all the time.
 idle_timeout = 30
 

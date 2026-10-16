@@ -19,14 +19,17 @@ want to say and just want a hand saying it.
   changes before accepting them, or skip the preview when you want to.
 - **Feels like part of Omarchy.** Matches your theme and uses familiar
   keyboard controls. Press an action's letter, or use the arrow keys and Enter.
-- **Fast.** Short rewrites typically take about one to two seconds.
-- **Uses your Claude Code subscription.** No separate API key needed.
-  Currently supports Claude Code only.
+- **Fast.** Short rewrites typically take about one to two seconds with
+  Claude, about three with Codex.
+- **Uses the coding agent you already have.** Claude Code or Codex, with your
+  existing subscription. No separate API key needed.
 
 ## Install
 
-You'll need **Omarchy 4.0 or newer** and **Claude Code logged in**.
-Run `claude` once if you haven't signed in yet.
+You'll need **Omarchy 4.0 or newer** and **Claude Code or Codex logged in**.
+AI Edit uses the agent Omarchy is set to (`omarchy default agent`), or
+Claude Code when that is another agent; `agent` in the config overrides it.
+Run `claude` or `codex` once if you haven't signed in yet.
 
 Install the plugin:
 
@@ -52,7 +55,7 @@ Delete the shortcut line from `bindings.lua` and run:
 
 ```bash
 omarchy plugin remove ai-edit
-rm -rf ~/.config/ai-edit ~/.local/state/ai-edit   # your config and Claude's working folder
+rm -rf ~/.config/ai-edit ~/.local/state/ai-edit   # your config and the agent's working folder
 ```
 
 ## Choose an action
@@ -117,11 +120,13 @@ open AI Edit.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `model` | `"sonnet"` | Claude model for actions that don't name one: `sonnet`, `haiku` or `opus`. |
+| `agent` | Omarchy's | The coding agent that rewrites: `claude` or `codex`. Left out, the agent Omarchy is set to, or `claude` when that is another one. |
+| `model` | per agent | Model for actions that don't name one. Claude: `sonnet` (default), `haiku` or `opus`. Codex: `gpt-6.1-sol` (default) or another model `codex` lists. |
+| `fast` | `true` | Codex only: Fast mode, about half a second quicker per rewrite, at the cost of more of your plan's usage. |
 | `preview` | `true` | Show the result before pasting it. Shift with the letter does the opposite. |
 | `compact` | `false` | Hide the action list and key hints; the letters keep working and **?** shows them. |
 | `width` | `560` | Width of the overlay. |
-| `idle_timeout` | `30` | Minutes without a rewrite before the waiting Claude process stops to free its memory (about 170 MB per model). The next rewrite then takes a few seconds longer. `0` keeps Claude ready all the time. |
+| `idle_timeout` | `30` | Minutes without a rewrite before the waiting agent process stops to free its memory (about 170 MB per model for Claude, 120 MB for Codex). The next rewrite then takes a few seconds longer. `0` keeps it ready all the time. |
 
 ### Your own actions
 
@@ -149,9 +154,12 @@ the shipped one as a whole, so keep the ones you want from the copied config.
 
 ## What happens to your text
 
-AI Edit sends the text you choose to Claude through Claude Code, using your
-existing account and its usage limits. Each rewrite starts fresh, with no
-conversation history, tools or MCP servers, and no saved Claude Code session.
+AI Edit sends the text you choose to Claude through Claude Code, or to OpenAI
+through Codex, using your existing account and its usage limits. Each rewrite
+starts fresh, with no conversation history, tools or MCP servers, and no saved
+session. Codex runs in a separate home in your runtime directory that shares
+only your login, so your Codex instructions, skills and plugins stay out of
+the request; AI Edit checks this before each new Codex version is used.
 
 Locally, text stays in your private runtime directory, never in command-line
 arguments or AI Edit logs. AI Edit restores the clipboard after capturing
@@ -162,23 +170,24 @@ clipboard.
 ## Under the hood
 
 A small shell script handles selection and paste, a service inside the
-Omarchy shell keeps Claude ready (about 170 MB, nearly all of it Claude Code
-itself, stopped after 30 minutes without use), and a QML overlay shows the
-result. From a terminal, `ai-edit run` starts Claude fresh, which takes a
-second longer.
+Omarchy shell keeps the agent ready (about 170 MB for Claude Code, 120 MB for
+Codex, stopped after 30 minutes without use), and a QML overlay shows the
+result. From a terminal, `ai-edit run` starts the agent fresh, which takes a
+second or two longer.
 
 See the [design notes](docs/design.md) for the architecture and measurements.
-To run the tests without a compositor or Claude requests:
+To run the tests without a compositor or agent requests:
 
 ```bash
 bin/ai-edit selftest
 tests/claude-test
+tests/codex-test
 ```
 
 ## Roadmap
 
-- **More coding agents.** Codex and the other agents Omarchy can set up, not
-  only Claude Code, following the agent you already use.
+- **More coding agents.** The other agents Omarchy can set up, beyond Claude
+  Code and Codex.
 - **An action on its own key**, such as Super+Shift+F to fix the selection
   without opening the list first.
 

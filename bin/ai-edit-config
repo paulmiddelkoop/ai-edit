@@ -16,7 +16,12 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ai-edit"
-SETTINGS = ("model", "preview", "compact", "width", "backend", "idle_timeout")
+SETTINGS = ("agent", "model", "fast", "preview", "compact", "width", "backend", "idle_timeout")
+AGENTS = ("claude", "codex")
+# The model an agent uses when the config names none.
+MODELS = {"claude": "sonnet", "codex": "gpt-6.1-sol"}
+CLAUDE_MODELS = ("sonnet", "haiku", "opus")
+OMARCHY_AGENT = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy/defaults/agent"
 
 
 class ConfigError(Exception):
@@ -33,6 +38,22 @@ def load(path):
         raise ConfigError(f"{path}: {error}")
 
 
+def default_agent():
+    """The agent Omarchy is set to, when AI Edit supports it; else claude."""
+    try:
+        agent = OMARCHY_AGENT.read_text().split()[0]
+    except (OSError, IndexError):
+        return "claude"
+    return agent if agent in AGENTS else "claude"
+
+
+def check_model(where, agent, model):
+    # A config written for one agent names models the other does not know.
+    claude = model in CLAUDE_MODELS or model.startswith("claude")
+    if claude != (agent == "claude") and (claude or model.startswith("gpt-")):
+        raise ConfigError(f"{where}: {model} is not a model for {agent}")
+
+
 def action_id(label):
     return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
 
@@ -46,6 +67,8 @@ def is_text(value):
 
 
 CHECKS = {
+    "agent": (lambda v: v in AGENTS, "claude or codex"),
+    "fast": (lambda v: isinstance(v, bool), "true or false"),
     "model": (is_text, "a model name such as \"sonnet\""),
     "preview": (lambda v: isinstance(v, bool), "true or false"),
     "compact": (lambda v: isinstance(v, bool), "true or false"),
@@ -69,6 +92,10 @@ def resolve(defaults, user):
     config = {key: defaults[key] for key in SETTINGS if key in defaults}
     config.setdefault("backend", "agent")
     config.update({key: user[key] for key in SETTINGS if key in user})
+    config.setdefault("agent", default_agent())
+    config.setdefault("model", MODELS[config["agent"]])
+    config.setdefault("fast", True)
+    check_model(CONFIG_DIR / "config.toml", config["agent"], config["model"])
 
     path = CONFIG_DIR / "config.toml" if "action" in user else PLUGIN_DIR / "config.toml"
     listed = user.get("action", defaults.get("action", []))
@@ -103,7 +130,8 @@ def resolve(defaults, user):
             resolved["id"] = next(c for c in candidates if c not in ids)
         ids.add(resolved["id"])
         resolved["instruction"] = action["instruction"].strip()
-        resolved.setdefault("model", config.get("model", "sonnet"))
+        resolved.setdefault("model", config["model"])
+        check_model(where, config["agent"], resolved["model"])
         resolved.setdefault("preview", config.get("preview", True))
         actions.append(resolved)
     return {"config": config, "actions": actions}

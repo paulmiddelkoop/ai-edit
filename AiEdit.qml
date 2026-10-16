@@ -134,7 +134,8 @@ Item {
     root.expanded = root.config.compact !== true
     var service = root.shell && typeof root.shell.serviceFor === "function" ? root.shell.serviceFor("ai-edit") : null
     if (service)
-      service.keepWarm([root.config.model].concat(root.actions.map(function(a) { return a.model })), root.config.idle_timeout)
+      service.keepWarm([root.config.model].concat(root.actions.map(function(a) { return a.model })),
+        root.config.idle_timeout, root.config.agent, root.config.fast)
     var session = state.session || {}
     root.compose = session.source !== "selection"
     root.copyOnly = root.compose || session.terminal === true || session.editable === "no"
@@ -215,7 +216,7 @@ Item {
     var run = root.runId
     var service = root.shell && typeof root.shell.serviceFor === "function" ? root.shell.serviceFor("ai-edit") : null
     if (service) {
-      service.rewrite(model || "sonnet", instruction, input, function(text) {
+      service.rewrite(model || root.config.model || "sonnet", instruction, input, function(text) {
         if (run !== root.runId) return
         root.stopCompares()
         var compare = compareComponent.createObject(root, { ownRun: run, input: JSON.stringify({ original: input, result: text }) })
@@ -226,7 +227,7 @@ Item {
       return
     }
     // Without the service (a shell that has not loaded it) the CLI runs a
-    // cold claude: slower, same result.
+    // cold agent: slower, same result.
     runProc.ownRun = run
     runProc.input = input
     runProc.environment = id === "-" ? { "AI_EDIT_INSTRUCTION": instruction } : { "AI_EDIT_INSTRUCTION": null }
@@ -291,14 +292,17 @@ Item {
   }
 
   function hint(message) {
+    var codex = root.config.agent === "codex"
+    var name = codex ? "Codex" : "Claude Code"
+    var command = codex ? "codex" : "claude"
     if (/usage limit|rate limit|limit reached/i.test(message))
-      return "The Claude usage limit is reached. Try again later."
+      return "The " + (codex ? "Codex" : "Claude") + " usage limit is reached. Try again later."
     if (/not installed/i.test(message))
-      return "Install Claude Code and log in with: claude"
+      return "Install " + name + " and log in with: " + command
     if (/log ?in|auth|credential|401/i.test(message))
-      return "Log in to Claude Code with: claude"
+      return "Log in to " + name + " with: " + command
     if (/did not answer|exited|could not be started|still starting/i.test(message))
-      return "Check that Claude Code works: run claude in a terminal"
+      return "Check that " + name + " works: run " + command + " in a terminal"
     return ""
   }
 

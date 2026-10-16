@@ -16,8 +16,8 @@ design, the measurements behind it and the open points; read it first.
 - Check QML with `qmllint` only. Do not start `qml`, `qmlscene` or a second
   `quickshell` to try it out: they abort without the shell's environment,
   and each abort is a crash notification on the desktop.
-- Run `bin/ai-edit selftest` and `tests/claude-test` before committing; they
-  need no compositor and make no Claude requests.
+- Run `bin/ai-edit selftest`, `tests/claude-test` and `tests/codex-test` before
+  committing; they need no compositor and make no agent requests.
 - Text captured from the screen is untrusted and may be large or secret: never
   pass it as a command-line argument, never log it, and keep it in
   `$XDG_RUNTIME_DIR` only.

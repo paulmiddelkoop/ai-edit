@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""ai-edit-claude: one rewrite by a fresh claude process.
+"""ai-edit-agent: one rewrite by a fresh agent process.
 
-Reads one request {"model", "instruction", "text"} on stdin and prints
-{"text": ...} or {"error": ...}. bin/ai-edit run uses it from a terminal;
-the overlay goes through Service.qml instead, which keeps claude waiting.
-The two speak the same protocol: keep user_message, extract_answer and
-split_padding in step with Service.qml.
+Reads one request {"agent", "model", "fast", "instruction", "text"} on stdin
+and prints {"text": ...} or {"error": ...}. bin/ai-edit run uses it from a
+terminal; the overlay goes through Service.qml instead, which keeps the agent
+waiting. The two speak the same protocol: keep user_message, extract_answer
+and split_padding in step with Service.qml. Codex speaks it through
+bin/ai-edit-codex.
 """
 
 import json
@@ -26,13 +27,16 @@ TURN_TIMEOUT = int(os.environ.get("AI_EDIT_TURN_TIMEOUT", "60"))
 MAX_REQUEST = 4 * 1024 * 1024
 WORK_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "ai-edit/agent"
 DEFAULT_MODEL = "sonnet"
+AGENTS = ("claude", "codex")
 
 
 class TurnError(Exception):
     pass
 
 
-def claude_command(model):
+def agent_command(agent, model, fast):
+    if agent == "codex":
+        return [str(PLUGIN_DIR / "bin/ai-edit-codex"), model] + (["--fast"] if fast else [])
     claude = os.environ.get("AI_EDIT_CLAUDE") or shutil.which("claude")
     if not claude:
         raise TurnError("claude is not installed")
@@ -80,16 +84,17 @@ def split_padding(text):
 
 
 class Worker:
-    """One claude process that serves exactly one turn."""
+    """One agent process that serves exactly one turn."""
 
-    def __init__(self, model):
+    def __init__(self, agent, model, fast=False):
+        self.agent = agent
         self.model = model
         self.events = queue.Queue()
         self.stderr = deque(maxlen=20)
         WORK_DIR.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, MAX_THINKING_TOKENS="0")
         self.proc = subprocess.Popen(
-            claude_command(model),
+            agent_command(agent, model, fast),
             cwd=WORK_DIR, env=env, text=True, bufsize=1,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
@@ -134,7 +139,7 @@ class Worker:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TurnError(f"claude did not answer within {TURN_TIMEOUT} s")
+                    raise TurnError(f"{self.agent} did not answer within {TURN_TIMEOUT} s")
                 try:
                     event = self.events.get(timeout=remaining)
                 except queue.Empty:
@@ -145,18 +150,18 @@ class Worker:
                     try:
                         self.proc.wait(timeout=max(0.1, deadline - time.monotonic()))
                     except subprocess.TimeoutExpired:
-                        raise TurnError(f"claude did not answer within {TURN_TIMEOUT} s")
-                    raise TurnError(self.failure(f"claude exited with status {self.proc.returncode}"))
+                        raise TurnError(f"{self.agent} did not answer within {TURN_TIMEOUT} s")
+                    raise TurnError(self.failure(f"{self.agent} exited with status {self.proc.returncode}"))
                 if event["type"] == "write_failed":
-                    raise TurnError(self.failure("claude exited before the request"))
+                    raise TurnError(self.failure(f"{self.agent} exited before the request"))
                 if event["type"] != "result":
                     continue
                 result = event.get("result") or ""
                 if event.get("is_error") or event.get("subtype") != "success":
-                    raise TurnError(result or event.get("subtype") or "claude reported an error")
+                    raise TurnError(result or event.get("subtype") or f"{self.agent} reported an error")
                 answer = extract_answer(result)
                 if not answer.strip():
-                    raise TurnError("claude returned nothing")
+                    raise TurnError(f"{self.agent} returned nothing")
                 return answer
         except BaseException:
             self.kill()
@@ -198,7 +203,14 @@ def parse_request(raw):
             raise TurnError(f"request has no {key}")
     if not request["text"].strip():
         raise TurnError("nothing to rewrite")
-    request["model"] = request.get("model") or DEFAULT_MODEL
+    request["agent"] = request.get("agent") or "claude"
+    if request["agent"] not in AGENTS:
+        raise TurnError(f"unknown agent {request['agent']}")
+    if request["agent"] == "claude":
+        request["model"] = request.get("model") or DEFAULT_MODEL
+    if not isinstance(request.get("model"), str) or not request["model"]:
+        raise TurnError("request has no model")
+    request["fast"] = request.get("fast") is True
     return request
 
 
@@ -210,12 +222,12 @@ def main():
     else:
         try:
             request = parse_request(raw)
-            worker = Worker(request["model"])
+            worker = Worker(request["agent"], request["model"], request["fast"])
             reply = {"text": rewrite(worker, request)}
         except (TurnError, OSError) as error:
             reply = {"error": str(error)}
     print(json.dumps(reply), flush=True)
-    # The answer is out; claude is ended before exiting, or it would be left
+    # The answer is out; the agent is ended before exiting, or it would be left
     # running on its own.
     if worker:
         worker.stop()

@@ -42,7 +42,7 @@ is not what AI Edit wants.
 1. **Fast**: about one second from keystroke to result. The agent is started
    ahead of time and waits for the next selection.
 2. **See the change**: a word-level diff before anything is pasted.
-3. **No API key**: uses the coding agent Omarchy already has (Claude Code);
+3. **No API key**: uses the coding agent Omarchy already has (Claude Code or Codex);
    an Anthropic API key is an optional alternative backend.
 
 README wording for the third point: "Uses the coding agent Omarchy already
@@ -68,8 +68,10 @@ Three parts, each testable from a terminal without the shell:
   the files. Subcommands: `open`, `compose`, `capture`, `run <id> [--insert]`,
   `compare`, `diff`, `insert`, `copy`, `selftest`.
 - `Service.qml`: the warm Claude pool, a `service` plugin inside omarchy-shell.
-- `bin/ai-edit-claude`: one rewrite by a fresh claude, for `ai-edit run` from a
+- `bin/ai-edit-agent`: one rewrite by a fresh agent, for `ai-edit run` from a
   terminal.
+- `bin/ai-edit-codex`: Codex behind claude's stream-json protocol, so the
+  pool and `ai-edit-agent` treat both agents alike (see Codex backend).
 - `AiEdit.qml` plus `components/`: the overlay. Draws only; every action is a
   call into `bin/ai-edit` or the service.
 
@@ -267,7 +269,70 @@ unbounded global instructions. Latency is still multiple seconds: compared
 with the earlier 3.66 s standard and 3.07 s Fast medians, the improvement is
 small and cannot be separated from server-load variation in these sequential
 runs. This does not establish that Codex matches Claude's earlier 1.26 s
-median. AI Edit's live backend remains Claude Code.
+median. AI Edit's live backend remains Claude Code; the Codex backend below
+followed.
+
+### Codex backend (October 16, 2026)
+
+`agent = "claude" | "codex"` picks the agent. Left out, AI Edit reads
+`~/.config/omarchy/defaults/agent` (what `omarchy default agent` prints) and
+falls back to claude for an agent it does not support. Models are per agent:
+the default is sonnet for Claude and gpt-6.1-sol for Codex, and a Claude model
+name with Codex (or a `gpt-` name with Claude) is a config error, so a config
+written for one agent fails clearly on the other.
+
+`bin/ai-edit-codex` is a bridge: it starts `codex app-server`, initializes
+it, then reads one claude stream-json user message and answers with a claude
+result event, starting a fresh ephemeral thread for that turn. Service.qml
+keeps it waiting like a claude process (one per model, one turn each, the
+same timeouts, idle stop and replacement), and `ai-edit-agent` runs it for a
+terminal rewrite. A JSON-RPC client in QML was the alternative; the bridge
+keeps the pool unchanged and is testable without the shell
+(`tests/codex-test` against `tests/fake-codex`). A waiting Codex costs about
+120 MB RSS (bridge 26 MB, app-server 93 MB) against about 240 MB for claude.
+The server gets `PR_SET_PDEATHSIG`, so a bridge the pool kills takes it along.
+
+Isolation for production, replacing the benchmark's bwrap mount: Codex runs
+with `CODEX_HOME=$XDG_RUNTIME_DIR/ai-edit/codex`, which holds only a symlink to
+the user's `auth.json`, the reduced model catalog and Codex's own state.
+Codex 0.163 saves `auth.json` by truncating and writing the existing path
+(`codex-rs/login/src/auth/storage.rs`), so a token it refreshes goes through
+the link into the user's file and the user's own Codex stays logged in; a
+copy would leave the user with a rotated-out refresh token. Keyring storage
+is keyed on the home's path and cannot be shared this way, so the bridge sets
+`cli_auth_credentials_store = "file"`. The runtime directory keeps Codex's
+logs and databases off disk; none of them held the text in a check.
+
+The catalog overrides (direct tool mode, no coding tools, AI Edit's system
+prompt as base instructions) still depend on the Codex version. Before the
+first server of a new Codex version, catalog or settings, the bridge runs
+`codex debug prompt-input` and refuses to start when anything other than the
+probe text and the permissions message would be sent. The result is
+remembered per version and settings, since the check costs about a second.
+The codex path is not resolved: under mise it is a shim, and resolving it
+runs mise itself.
+
+Model choice, measured with the isolated benchmark on Codex 0.163.0, low
+effort (the lowest every candidate offers), six synthetic texts twice per
+condition, run sequentially ([results](benchmarks/2026-10-16-models.json)):
+
+| Model | Tier | Median | Range |
+| --- | --- | --- | --- |
+| GPT-6.1 Sol | standard | 3.24 s | 2.74–3.76 s |
+| GPT-6.1 Sol | Fast | 2.74 s | 2.27–5.06 s |
+| GPT-6 Luna | standard | 2.83 s | 2.15–4.56 s |
+| GPT-6 Luna | Fast | 2.59 s | 2.12–3.98 s |
+| GPT-5.6 Luna | Fast | 2.59 s | 2.02–3.04 s |
+| GPT-6 Astra | Fast | 3.08 s | 2.66–3.99 s |
+
+Sol was correct and consistent on every sample. Both Lunas again turned the
+proposal in the Improve sample ("can we do Thursday instead?") into a
+decision to move the meeting, GPT-6 Luna dropped "still" from the
+translation and once used a curly apostrophe. Astra was slower without
+better output. Fast saved Sol about half a second, as on October 10, and a
+rewrite is about 570 tokens, so its extra usage is small: the default is
+gpt-6.1-sol with Fast on, `fast = false` to save usage. Codex stays about
+twice as slow as Claude (1.26 s), which the README says.
 
 ### Capture and insert (measured)
 
@@ -447,6 +512,8 @@ whitespace tokens kept) and written as `diff.json`, a list of
   at once, so busy, diff, error and the warm pool are reused; `preview =
   false` pastes after the "Fix…" line, otherwise the diff waits for Enter.
   The binding then lists itself in Super+K.
+- More agents than Claude and Codex: each needs a way to wait warm for one
+  turn behind the stream-json protocol, as `bin/ai-edit-codex` does.
 - Whether AI Edit could be part of Omarchy itself (raised October 10, 2026).
   The overlay needs no change: the shell's own overlays (emojis, clipboard,
   reminders) are QML plugins like this one, and Super+K is walker, not QML.

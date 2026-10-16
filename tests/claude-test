@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs bin/ai-edit-claude against tests/fake-claude: answers and failures.
+# Runs bin/ai-edit-agent against tests/fake-claude: answers and failures.
 set -uo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -11,7 +11,7 @@ failures=0
 
 ask() {
   jq -cn --arg instruction "$1" --arg text "$2" '{instruction: $instruction, text: $text}' |
-    "$root/bin/ai-edit-claude"
+    "$root/bin/ai-edit-agent"
 }
 
 expect() {
@@ -37,12 +37,12 @@ expect "answer from a claude that keeps running" '{"text": "HI"}' "$(ask stubbor
 # More text than a pipe holds, to a claude that never reads it.
 started=$SECONDS
 got=$(python3 -c 'import json; print(json.dumps({"instruction": "echo", "text": "word " * 600000}))' |
-  FAKE_CLAUDE_DEAF=1 "$root/bin/ai-edit-claude")
+  FAKE_CLAUDE_DEAF=1 "$root/bin/ai-edit-agent")
 expect "timeout covers a blocked write" '{"error": "claude did not answer within 2 s"}' "$got"
 expect "blocked write ends in time" yes "$( ((SECONDS - started <= 5)) && echo yes || echo no)"
 # A custom instruction from the terminal, end to end through bin/ai-edit.
 expect "custom instruction" "HELLO THERE" "$(printf 'hello there' | AI_EDIT_INSTRUCTION=echo "$root/bin/ai-edit" run -)"
-expect "bad request" '{"error": "request is not JSON"}' "$(echo nope | "$root/bin/ai-edit-claude")"
+expect "bad request" '{"error": "request is not JSON"}' "$(echo nope | "$root/bin/ai-edit-agent")"
 sleep 0.5
 expect "no stray processes" 0 "$(pgrep -fc "$AI_EDIT_CLAUDE")"
 

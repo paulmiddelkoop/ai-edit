@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""ai-edit-codex: Codex behind the protocol AI Edit speaks with claude.
+
+    ai-edit-codex <model> [--fast]
+
+Starts a Codex app-server ready for one rewrite, then reads one claude
+stream-json user message on stdin and answers with a claude result event on
+stdout, so Service.qml and bin/ai-edit-agent keep a waiting Codex as they keep
+a waiting claude. Exits after that turn, or when stdin closes first.
+
+Codex runs in a home of its own under $XDG_RUNTIME_DIR, with the user's
+auth.json linked in: the user's AGENTS.md, skills, plugins, MCP servers and
+history stay out of the request, whatever is on disk is gone at logout, and
+a token Codex refreshes is written through the link into the user's own
+file. A model catalog with the coding tools taken out replaces Codex's
+default instructions with AI Edit's system prompt. Before the server is
+started, the prompt Codex would send is checked to hold only the text and
+Codex's short permissions message.
+"""
+
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+SYSTEM_PROMPT_FILE = PLUGIN_DIR / "system-prompt.txt"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "ai-edit"
+WORK_DIR = STATE_DIR / "agent"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "ai-edit"
+HOME = RUNTIME_DIR / "codex"
+USER_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+TURN_TIMEOUT = int(os.environ.get("AI_EDIT_TURN_TIMEOUT", "60"))
+PROBE = "AI Edit context check."
+
+OVERRIDES = {
+    "approval_policy": "never", "sandbox_mode": "read-only",
+    "cli_auth_credentials_store": "file", "project_doc_max_bytes": 0,
+    "history.persistence": "none", "analytics.enabled": False,
+    "web_search": "disabled", "apps._default.enabled": False,
+    "tools.update_plan.enabled": False,
+    "tools.experimental_request_user_input.enabled": False,
+    "skills.include_instructions": False,
+    "include_apps_instructions": False,
+    "include_collaboration_mode_instructions": False,
+    "include_environment_context": False,
+    "features.skip_host_skill_discovery": True,
+    "features.multi_agent_v2.enabled": False,
+    "features.multi_agent_v2.usage_hint_enabled": False,
+    "features.multi_agent_v2.root_agent_usage_hint_text": "",
+    "features.multi_agent_v2.usage_hint_text": "",
+    "features.multi_agent_v2.multi_agent_mode_hint_text": "",
+}
+for feature in ("hooks", "shell_tool", "code_mode", "multi_agent", "apps", "memories",
+                "plugins", "code_mode_host", "goals", "sleep_tool", "image_generation",
+                "view_image", "browser_use", "computer_use", "unified_exec", "skill_search",
+                "tool_suggest", "shell_snapshot", "workspace_dependencies"):
+    OVERRIDES["features." + feature] = False
+
+
+class Failure(Exception):
+    pass
+
+
+def codex_binary():
+    # Not resolved: a version manager's shim runs the manager itself then.
+    codex = os.environ.get("AI_EDIT_CODEX") or shutil.which("codex")
+    if not codex:
+        raise Failure("codex is not installed")
+    return codex
+
+
+def lowest_effort(model):
+    levels = [level.get("effort") for level in model.get("supported_reasoning_levels") or []]
+    return next((level for level in levels if level), "low")
+
+
+def prepare_home(model_slug, system_prompt):
+    """The isolated Codex home and its catalog; returns the model's entry."""
+    try:
+        catalog = json.loads((USER_HOME / "models_cache.json").read_text())
+    except (OSError, ValueError):
+        raise Failure("Start Codex once so it knows its models: run codex")
+    model = next((m for m in catalog.get("models", []) if m.get("slug") == model_slug), None)
+    if model is None:
+        raise Failure(f"Codex has no model {model_slug}")
+    # The coding tools come with the catalog entry, not with feature flags.
+    model.update(tool_mode="direct", multi_agent_version="v1",
+                 experimental_supported_tools=[], apply_patch_tool_type=None,
+                 base_instructions=system_prompt)
+    model.pop("model_messages", None)
+
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    auth = USER_HOME.resolve() / "auth.json"
+    link = HOME / "auth.json"
+    if auth.is_file():
+        if not (link.is_symlink() and os.readlink(link) == str(auth)):
+            link.unlink(missing_ok=True)
+            link.symlink_to(auth)
+    else:
+        link.unlink(missing_ok=True)
+    catalog_file = HOME / f"models-{model_slug}.json"
+    content = json.dumps({"models": [model]})
+    if not catalog_file.is_file() or catalog_file.read_text() != content:
+        temp = catalog_file.with_suffix(".tmp")
+        temp.write_text(content)
+        temp.replace(catalog_file)
+    return model, catalog_file
+
+
+def command(codex, model, catalog_file, fast, *arguments):
+    settings = dict(OVERRIDES, model=model["slug"], model_reasoning_effort=lowest_effort(model),
+                    service_tier="priority" if fast else "default",
+                    model_catalog_json=str(catalog_file),
+                    model_instructions_file=str(SYSTEM_PROMPT_FILE))
+    argv = [codex, *arguments]
+    for key, value in settings.items():
+        argv += ["-c", f"{key}={json.dumps(value)}"]
+    return argv
+
+
+def environment():
+    return dict(os.environ, CODEX_HOME=str(HOME))
+
+
+def check_context(codex, model, catalog_file, fast):
+    """Refuses a Codex that would send more than the text, once per setup."""
+    argv = command(codex, model, catalog_file, fast, "debug", "prompt-input", PROBE)
+    try:
+        version = subprocess.run([codex, "--version"], env=environment(), capture_output=True,
+                                 text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        raise Failure("codex could not be started")
+    key = hashlib.sha256(json.dumps([argv, version, catalog_file.read_text()]).encode()).hexdigest()
+    stamp = HOME / f"checked-{model['slug']}-{'fast' if fast else 'standard'}"
+    try:
+        if stamp.read_text() == key:
+            return
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(argv, cwd=WORK_DIR, env=environment(), capture_output=True,
+                                text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise Failure("codex did not start within 30 s")
+    if result.returncode != 0:
+        raise Failure(last_line(result.stderr) or f"codex exited with status {result.returncode}")
+    try:
+        messages = json.loads(result.stdout)
+    except ValueError:
+        raise Failure("codex gave an unreadable prompt check")
+    for message in messages:
+        text = "".join(part.get("text", "") for part in message.get("content", []))
+        if message.get("role") == "developer" and text.startswith("<permissions instructions>"):
+            continue
+        if message.get("role") == "user" and text == PROBE:
+            continue
+        raise Failure("This Codex version would send more than the text; AI Edit does not support it yet")
+    stamp.write_text(key)
+
+
+def last_line(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1][:300] if lines else ""
+
+
+def die_with_parent():
+    # The server must not outlive a bridge that is killed.
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)
+
+
+class Server:
+    def __init__(self, argv):
+        self.events = queue.Queue()
+        self.stderr = deque(maxlen=20)
+        self.seq = 0
+        self.proc = subprocess.Popen(
+            argv, cwd=WORK_DIR, env=environment(), text=True, bufsize=1,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=die_with_parent)
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            try:
+                self.events.put(json.loads(line))
+            except ValueError:
+                pass
+        self.events.put(None)
+
+    def _read_stderr(self):
+        for line in self.proc.stderr:
+            if line.strip():
+                self.stderr.append(line.strip()[:300])
+
+    def failure(self, fallback):
+        return " ".join(self.stderr) or fallback
+
+    def send(self, message):
+        try:
+            self.proc.stdin.write(json.dumps(message) + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            raise Failure(self.failure("codex exited"))
+
+    def next(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Failure(f"codex did not answer within {TURN_TIMEOUT} s")
+        try:
+            event = self.events.get(timeout=remaining)
+        except queue.Empty:
+            raise Failure(f"codex did not answer within {TURN_TIMEOUT} s")
+        if event is None:
+            raise Failure(self.failure("codex exited"))
+        if "method" in event and "id" in event:
+            # An approval or a question: a rewrite has no tools to approve.
+            self.send({"id": event["id"], "error": {"code": -32601, "message": "not supported"}})
+            raise Failure(f"codex asked for {event['method']}, which AI Edit does not allow")
+        return event
+
+    def rpc(self, method, params, deadline):
+        self.seq += 1
+        seq = self.seq
+        self.send({"id": seq, "method": method, "params": params})
+        while True:
+            event = self.next(deadline)
+            if event.get("id") == seq:
+                if "error" in event:
+                    raise Failure(error_text(event["error"]) or f"codex refused {method}")
+                return event.get("result") or {}
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+
+def error_text(error):
+    if isinstance(error, dict):
+        return error.get("message") or error_text(error.get("error")) or ""
+    return str(error or "")
+
+
+def turn(server, model, fast, content, system_prompt):
+    deadline = time.monotonic() + TURN_TIMEOUT
+    tier = "priority" if fast else "default"
+    effort = lowest_effort(model)
+    thread = server.rpc("thread/start", {
+        "model": model["slug"], "allowProviderModelFallback": False,
+        "cwd": str(WORK_DIR), "ephemeral": True, "approvalPolicy": "never",
+        "sandbox": "read-only", "baseInstructions": system_prompt,
+        "developerInstructions": "", "environments": [], "dynamicTools": [],
+        "selectedCapabilityRoots": [], "serviceTier": tier,
+        "config": {"model_reasoning_effort": effort, "project_doc_max_bytes": 0},
+    }, deadline)["thread"]["id"]
+    server.rpc("turn/start", {
+        "threadId": thread, "effort": effort, "serviceTierForTurn": tier, "environments": [],
+        "input": [{"type": "text", "text": content, "text_elements": []}],
+    }, deadline)
+    answer, error = [], ""
+    while True:
+        event = server.next(deadline)
+        params = event.get("params") or {}
+        if params.get("threadId") != thread:
+            continue
+        method = event.get("method")
+        if method == "item/completed":
+            item = params.get("item") or {}
+            if item.get("type") == "agentMessage":
+                answer.append(item.get("text", ""))
+            elif item.get("type") not in ("userMessage", "reasoning"):
+                raise Failure(f"codex tried to use {item.get('type')}")
+        elif method == "error":
+            error = error_text(params.get("error")) or error
+        elif method == "turn/completed":
+            done = params.get("turn") or {}
+            if done.get("status") != "completed":
+                raise Failure(error_text(done.get("error")) or error or f"codex turn {done.get('status')}")
+            return "\n".join(answer)
+
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="One Codex rewrite behind claude's stream-json protocol.")
+    parser.add_argument("model")
+    parser.add_argument("--fast", action="store_true")
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+    server = None
+    try:
+        system_prompt = SYSTEM_PROMPT_FILE.read_text().strip()
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        codex = codex_binary()
+        model, catalog_file = prepare_home(args.model, system_prompt)
+        check_context(codex, model, catalog_file, args.fast)
+        server = Server(command(codex, model, catalog_file, args.fast,
+                                "app-server", "--strict-config", "--listen", "stdio://"))
+        deadline = time.monotonic() + 30
+        server.rpc("initialize", {"clientInfo": {"name": "ai_edit", "version": "1"},
+                                  "capabilities": {"experimentalApi": True}}, deadline)
+        server.send({"method": "initialized"})
+
+        line = sys.stdin.readline()
+        if not line:
+            return 0
+        try:
+            content = json.loads(line)["message"]["content"][0]["text"]
+        except (ValueError, LookupError, TypeError):
+            raise Failure("the request is not a claude user message")
+        result = turn(server, model, args.fast, content, system_prompt)
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": result})
+        return 0
+    except Failure as failure:
+        emit({"type": "result", "subtype": "error", "is_error": True, "result": str(failure)})
+        print(failure, file=sys.stderr, flush=True)
+        return 1
+    finally:
+        if server:
+            server.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

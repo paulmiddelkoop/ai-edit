@@ -2,12 +2,13 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Keeps a claude process waiting per model inside omarchy-shell, so a rewrite
+// Keeps an agent process waiting per model inside omarchy-shell, so a rewrite
 // costs only the API time. Each process answers one turn and is replaced at
 // once, so no conversation builds up. The overlay calls rewrite().
 //
-// bin/ai-edit-claude speaks the same protocol for `ai-edit run`: keep
-// userMessage, extractAnswer and the padding in step with it.
+// bin/ai-edit-agent speaks the same protocol for `ai-edit run`: keep
+// userMessage, extractAnswer and the padding in step with it. Codex speaks
+// claude's protocol through bin/ai-edit-codex.
 Item {
   id: root
 
@@ -25,6 +26,8 @@ Item {
   property bool closing: false
   Component.onDestruction: root.closing = true
   property var models: []
+  property string agent: "claude"
+  property bool fast: false
   // Minutes without use after which the waiting processes are stopped to
   // free their memory; 0 keeps them. A busy process is never in idle.
   property int idleTimeout: 30
@@ -39,7 +42,7 @@ Item {
       fail("Nothing to rewrite")
       return
     }
-    // As bin/ai-edit-claude: claude reads the request as one line.
+    // As bin/ai-edit-agent: the agent reads the request as one line.
     if (text.length > root.maxText) {
       fail("The text is too large")
       return
@@ -54,7 +57,7 @@ Item {
     root.lastUse = Date.now()
     var worker = root.take(model)
     if (!worker) {
-      fail("claude could not be started")
+      fail(root.agent + " could not be started")
       return
     }
     worker.turn(root.userMessage(instruction, core), {
@@ -68,9 +71,14 @@ Item {
   // The models the actions use; the overlay passes them when it opens, so a
   // model added to the config is warm from the next rewrite on. Opening counts
   // as use: a process stopped for idleness starts while a letter is chosen.
-  function keepWarm(list, idleTimeout) {
+  function keepWarm(list, idleTimeout, agent, fast) {
     if (typeof idleTimeout === "number" && idleTimeout >= 0) root.idleTimeout = idleTimeout
     root.lastUse = Date.now()
+    if (agent && (agent !== root.agent || (fast === true) !== root.fast)) {
+      root.agent = agent
+      root.fast = fast === true
+      root.sleep()
+    }
     var unique = []
     for (var i = 0; i < list.length; i++)
       if (list[i] && unique.indexOf(list[i]) === -1) unique.push(list[i])
@@ -106,11 +114,12 @@ Item {
 
   function fresh(worker) {
     return worker && worker.running && !worker.busy && Date.now() - worker.bornAt < root.maxAge
+      && worker.agent === root.agent && worker.fast === root.fast
   }
 
   function spawn(model) {
     if (root.closing) return null
-    return workerComponent.createObject(root, { model: model })
+    return workerComponent.createObject(root, { model: model, agent: root.agent, fast: root.fast })
   }
 
   function warm(model) {
@@ -160,6 +169,8 @@ Item {
       id: proc
 
       property string model: ""
+      property string agent: "claude"
+      property bool fast: false
       property real bornAt: Date.now()
       property bool busy: false
       property var request: null
@@ -188,17 +199,17 @@ Item {
         if (!event || event.type !== "result") return
         var result = event.result || ""
         if (event.is_error || event.subtype !== "success") {
-          proc.settle(result || event.subtype || "claude reported an error")
+          proc.settle(result || event.subtype || proc.agent + " reported an error")
         } else {
           var answer = root.extractAnswer(result)
-          if (!answer.trim()) proc.settle("claude returned nothing")
+          if (!answer.trim()) proc.settle(proc.agent + " returned nothing")
           else proc.settle("", answer)
         }
         // Its replacement is already waiting.
         proc.stop(false)
       }
 
-      // Closing stdin ends claude after a turn and SIGTERM ends it otherwise;
+      // Closing stdin ends the agent after a turn and SIGTERM ends it otherwise;
       // one that ignores both is killed, or it would sit outside the pool
       // holding its memory.
       function stop(terminate) {
@@ -219,18 +230,20 @@ Item {
       property Timer timer: Timer {
         interval: root.turnTimeout
         onTriggered: {
-          proc.settle("claude did not answer within " + Math.round(root.turnTimeout / 1000) + " s")
+          proc.settle(proc.agent + " did not answer within " + Math.round(root.turnTimeout / 1000) + " s")
           proc.stop(true)
         }
       }
 
-      command: ["claude", "-p",
-        "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-        "--no-session-persistence",
-        "--restricted", "--tools", "",
-        "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
-        "--model", proc.model,
-        "--system-prompt", root.systemPrompt]
+      command: proc.agent === "codex"
+        ? [root.pluginDir + "/bin/ai-edit-codex", proc.model].concat(proc.fast ? ["--fast"] : [])
+        : ["claude", "-p",
+          "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+          "--no-session-persistence",
+          "--restricted", "--tools", "",
+          "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
+          "--model", proc.model,
+          "--system-prompt", root.systemPrompt]
       // An empty directory, so no project CLAUDE.md is picked up; thinking off,
       // since on a rewrite it adds seconds.
       workingDirectory: root.workDir
@@ -251,7 +264,7 @@ Item {
 
       onExited: function(code) {
         proc.killTimer.stop()
-        proc.settle(proc.stderrLines.join(" ") || "claude exited with status " + code)
+        proc.settle(proc.stderrLines.join(" ") || proc.agent + " exited with status " + code)
         root.forget(proc)
         Qt.callLater(proc.destroy)
       }
@@ -259,7 +272,7 @@ Item {
   }
 
   // Replaces waiting processes that died or are older than an hour (auth and
-  // updates are picked up when claude starts), or stops them after
+  // updates are picked up when the agent starts), or stops them after
   // idleTimeout minutes without use.
   Timer {
     interval: 30000
@@ -295,15 +308,17 @@ Item {
     stdout: StdioCollector { id: configOut; waitForEnd: true }
     onExited: function(code) {
       var list = ["sonnet"]
-      var idleTimeout
+      var idleTimeout, agent, fast
       if (code === 0) {
         try {
           var settings = JSON.parse(configOut.text)
           list = [settings.config.model].concat(settings.actions.map(function(a) { return a.model }))
           idleTimeout = settings.config.idle_timeout
+          agent = settings.config.agent
+          fast = settings.config.fast
         } catch (e) {}
       }
-      root.keepWarm(list, idleTimeout)
+      root.keepWarm(list, idleTimeout, agent, fast)
     }
   }
 }

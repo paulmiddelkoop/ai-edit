@@ -440,8 +440,9 @@ run() {
   local reply
   reply=$(mktemp "$STATE_DIR/reply.XXXXXX") || die "cannot write to $STATE_DIR"
   printf '%s' "$action" |
-    jq -c --rawfile text "$ORIGINAL" '{model, instruction, text: $text}' |
-    "$PLUGIN_DIR/bin/ai-edit-claude" >"$reply"
+    jq -c --rawfile text "$ORIGINAL" --argjson agent "$(jq -c '.config | {agent, fast}' <<<"$all")" \
+      '$agent + {model, instruction, text: $text}' |
+    "$PLUGIN_DIR/bin/ai-edit-agent" >"$reply"
 
   if ! jq -e 'has("text")' "$reply" >/dev/null 2>&1; then
     local error
@@ -736,6 +737,26 @@ TOML
     [[ $(actions 2>&1) == *"key y is taken"* ]] || exit 1
   )
   check "a broken config is an error that says why" broken_config
+  agent_choice() (
+    export XDG_CONFIG_HOME=$STATE_DIR/agent
+    mkdir -p "$XDG_CONFIG_HOME/ai-edit" "$XDG_CONFIG_HOME/omarchy/defaults"
+    config | jq -e '.agent == "claude" and .model == "sonnet"' >/dev/null || exit 1
+    echo codex >"$XDG_CONFIG_HOME/omarchy/defaults/agent"
+    config | jq -e '.agent == "codex" and .model == "gpt-6.1-sol" and .fast' >/dev/null || exit 1
+    actions | jq -e 'all(.[]; .model == "gpt-6.1-sol")' >/dev/null || exit 1
+    echo opencode >"$XDG_CONFIG_HOME/omarchy/defaults/agent"
+    config | jq -e '.agent == "claude"' >/dev/null || exit 1
+    printf 'agent = "codex"\nfast = false\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    config | jq -e '.agent == "codex" and (.fast | not)' >/dev/null || exit 1
+    printf 'agent = "codex"\nmodel = "haiku"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    [[ $(config 2>&1) == *"haiku is not a model for codex"* ]] || exit 1
+    printf 'agent = "codex"\n[[action]]\nkey = "a"\nlabel = "A"\ninstruction = "x"\nmodel = "opus"\n' \
+      >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    [[ $(actions 2>&1) == *"opus is not a model for codex"* ]] || exit 1
+    printf 'agent = "pi"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+    [[ $(config 2>&1) == *"agent must be claude or codex"* ]]
+  )
+  check "the agent follows Omarchy unless the config names one" agent_choice
   action_ids() (
     export XDG_CONFIG_HOME=$STATE_DIR/ids
     mkdir -p "$XDG_CONFIG_HOME/ai-edit"

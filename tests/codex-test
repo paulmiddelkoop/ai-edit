@@ -1,0 +1,82 @@
+#!/bin/bash
+# Runs bin/ai-edit-agent with agent codex against tests/fake-codex: the
+# isolated Codex home, answers and failures.
+set -uo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+export XDG_RUNTIME_DIR=$tmp/run XDG_STATE_HOME=$tmp/state XDG_CONFIG_HOME=$tmp/config
+export CODEX_HOME=$tmp/user-codex AI_EDIT_CODEX=$root/tests/fake-codex AI_EDIT_TURN_TIMEOUT=2
+export FAKE_CODEX_LOG=$tmp/codex.log
+home=$XDG_RUNTIME_DIR/ai-edit/codex
+mkdir -p "$CODEX_HOME" "$XDG_RUNTIME_DIR"
+printf '{"auth_mode": "chatgpt"}' >"$CODEX_HOME/auth.json"
+cat >"$CODEX_HOME/models_cache.json" <<'JSON'
+{"models": [{"slug": "gpt-test", "tool_mode": "code", "multi_agent_version": "v2",
+  "experimental_supported_tools": ["x"], "apply_patch_tool_type": "freeform",
+  "model_messages": {"instructions_template": "coding agent"}, "base_instructions": "coding agent",
+  "supported_reasoning_levels": [{"effort": "minimal"}, {"effort": "low"}]}]}
+JSON
+failures=0
+
+ask() {
+  jq -cn --arg instruction "$1" --arg text "$2" --argjson fast "${3:-false}" \
+    '{agent: "codex", model: "gpt-test", fast: $fast, instruction: $instruction, text: $text}' |
+    "$root/bin/ai-edit-agent"
+}
+
+expect() {
+  local name="$1" want="$2" got="$3"
+  if [[ $got == "$want" ]]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: wanted $want, got $got"
+    failures=$((failures + 1))
+  fi
+}
+
+expect "answer" '{"text": "HELLO"}' "$(ask echo hello)"
+expect "padding kept" '{"text": "\n  HELLO WORLD\n"}' "$(ask echo $'\n  hello world\n')"
+expect "lowest effort, standard tier" '{"text": "default minimal"}' "$(ask tier hi)"
+expect "fast is the priority tier" '{"text": "priority minimal"}' "$(ask tier hi true)"
+expect "error result" '{"error": "You'"'"'ve hit your usage limit."}' "$(ask fail hi)"
+expect "dead server" '{"error": "Error: fake codex gave up"}' "$(ask die hi)"
+expect "timeout" '{"error": "codex did not answer within 2 s"}' "$(ask hang hi)"
+expect "no approvals" '{"error": "codex asked for item/commandExecution/requestApproval, which AI Edit does not allow"}' "$(ask ask hi)"
+expect "no tools" '{"error": "codex tried to use commandExecution"}' "$(ask tool hi)"
+expect "unknown model" '{"error": "Codex has no model gpt-none"}' \
+  "$(jq -cn '{agent: "codex", model: "gpt-none", instruction: "echo", text: "hi"}' | "$root/bin/ai-edit-agent")"
+
+expect "codex runs in its own home" "$home" "$(jq -r .home "$FAKE_CODEX_LOG" | sort -u)"
+expect "auth is linked, not copied" "$CODEX_HOME/auth.json" "$(readlink "$home/auth.json")"
+expect "catalog without coding tools" true "$(jq --rawfile prompt "$root/system-prompt.txt" '.models[0] |
+  .tool_mode == "direct" and .multi_agent_version == "v1" and .experimental_supported_tools == []
+  and .apply_patch_tool_type == null and (has("model_messages") | not)
+  and .base_instructions == ($prompt | rtrimstr("\n"))' "$home/models-gpt-test.json")"
+expect "context checked once per setup" 2 "$(jq -r 'select(.command[0] == "debug") | 1' "$FAKE_CODEX_LOG" | wc -l)"
+FAKE_CODEX_VERSION=0.2.0 ask echo hi >/dev/null
+expect "a new codex version is checked again" 3 "$(jq -r 'select(.command[0] == "debug") | 1' "$FAKE_CODEX_LOG" | wc -l)"
+: >"$FAKE_CODEX_LOG"
+rm -f "$home"/checked-*
+expect "extra context is refused" '{"error": "This Codex version would send more than the text; AI Edit does not support it yet"}' \
+  "$(FAKE_CODEX_LEAK=1 ask echo hi)"
+expect "no server after a refused check" 0 "$(jq -r 'select(.command[0] == "app-server") | 1' "$FAKE_CODEX_LOG" | wc -l)"
+
+# The overlay's way in: a waiting bridge whose stdin closes, or that is killed.
+"$root/bin/ai-edit-codex" gpt-test </dev/null
+expect "a bridge without a request ends" 0 "$?"
+sleep 30 | "$root/bin/ai-edit-codex" gpt-test &
+bridge=$!
+sleep 0.5
+kill -9 "$bridge"
+sleep 0.5
+expect "no stray processes" 0 "$(pgrep -fc "$AI_EDIT_CODEX")"
+
+# End to end through bin/ai-edit, following Omarchy's default agent.
+mkdir -p "$XDG_CONFIG_HOME/omarchy/defaults" "$XDG_CONFIG_HOME/ai-edit"
+echo codex >"$XDG_CONFIG_HOME/omarchy/defaults/agent"
+printf 'model = "gpt-test"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+expect "custom instruction" "HELLO THERE" "$(printf 'hello there' | AI_EDIT_INSTRUCTION=echo "$root/bin/ai-edit" run -)"
+
+((failures == 0)) || exit 1
