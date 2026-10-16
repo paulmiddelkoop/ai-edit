@@ -345,6 +345,110 @@ rewrite is about 570 tokens, so its extra usage is small: the default is
 gpt-6.1-sol with Fast on, `fast = false` to save usage. Codex stays about
 twice as slow as Claude (1.26 s), which the README says.
 
+### opencode as a backend (October 16, 2026)
+
+Research only: can opencode 2.0.31 be a third agent behind the same bar
+(warm, isolated, comparable latency)? Measured with
+[opencode-benchmark](benchmarks/opencode-benchmark), the same six synthetic
+texts twice per condition, one server per condition, a fresh session per
+rewrite ([results](benchmarks/2026-10-16-opencode.json)):
+
+```sh
+python3 docs/benchmarks/opencode-benchmark openai/gpt-6.1-sol --output /tmp/opencode-standard.json
+python3 docs/benchmarks/opencode-benchmark openai/gpt-6.1-sol-fast --output /tmp/opencode-fast.json
+```
+
+| GPT-6.1 Sol, low effort | Median | Range | Input tokens |
+| --- | --- | --- | --- |
+| opencode, standard | 3.22 s | 2.63–16.64 s | 237–289 |
+| opencode, Fast | 2.72 s | 2.40–6.10 s | 237–289 |
+| Codex isolated, standard (above) | 3.24 s | 2.74–3.76 s | 544–588 |
+| Codex isolated, Fast (above) | 2.74 s | 2.27–5.06 s | 544–588 |
+
+The medians match Codex's to the hundredth: the agent adds nothing that
+shows, and the remaining seconds are the model behind the ChatGPT login.
+Each run had one outlier (16.6 s and 6.1 s) whose cause was not recorded.
+The first rewrite of a fresh server was 0.3 to 0.7 s slower than the
+median. Outputs equalled Codex's Sol outputs in substance, with no tools,
+reasoning tokens or extra model calls. Claude could not be compared:
+opencode has no Claude subscription login, only an Anthropic API key.
+
+**Warm mode.** `opencode serve --stdio` is not a stdio protocol: it starts
+the v2 HTTP API on localhost, prints `{"url": ...}` and exits when stdin
+closes, which suits a bridge. The server requires a password
+(`OPENCODE_PASSWORD`, basic auth). A rewrite is four calls:
+`POST /api/session` (agent, model with variant, title, directory),
+`POST /api/session/{id}/prompt`, `POST /api/experimental/session/{id}/wait`,
+`GET /api/session/{id}/message?type=assistant`, then `DELETE` the session.
+Setup took 0.13 s and a session 0.03 s. One server serves any number of
+sessions, so unlike claude and Codex a session gives the fresh context and
+the process can stay. There is no ephemeral session: messages go to the
+SQLite database until the session is deleted.
+
+**Context.** Configuration, plugins, skills and AGENTS.md come from the
+config and data directories, so a server with its own `XDG_*` directories,
+`HOME`, `OPENCODE_DISABLE_PROJECT_CONFIG=1` and `OPENCODE_DISABLE_CLAUDE_CODE=1`
+loads none of the user's. CLAUDE.md is not read by v2. Settings come in
+`OPENCODE_CONFIG_CONTENT`: an agent whose `system` is AI Edit's prompt
+replaces opencode's own, a deny-all permission rule removes every tool
+definition from the request (not only their use), and a given session
+title skips the title request. Built-in plugins are removed by ID
+(`-opencode.prompt.identity`, `-opencode.tools`,
+`-opencode.config.instruction`). What config cannot remove is the date and
+`<env>` block (working directory, platform, git, temp directory) that
+opencode appends to every system prompt. `/etc/opencode` is always read; it
+is admin-managed, not personal.
+
+There is no `debug prompt-input`. A plugin does that work instead, and more
+precisely: its `context` hook sees the system parts, tool definitions and
+messages right before dispatch, drops everything after AI Edit's prompt, and
+throws when there is a tool, another message or another prompt; a throw
+sends nothing (tested: no request, no assistant message). Its `http.request`
+hook sees the final body (zstd-compressed on the ChatGPT route). In all 24
+requests the body held `instructions` equal to the system prompt, one user
+message, no tools, `store: false`, reasoning low and opencode's
+`text.verbosity: low`. Input was 237–289 tokens, half of Codex's isolated
+request. The benchmark records sizes and shapes, not text. A production
+bridge would send a probe text whose `context` hook throws after checking,
+so the check costs no request, and refuse to use a server whose plugin did
+not answer.
+
+**Credentials.** There is nothing to link. Logins live in the `credential`
+table of `opencode.db`, refreshed in place; `auth.json` is only read once by
+a migration on an existing database. The benchmark therefore points
+`OPENCODE_DB` at the user's own database: nothing is copied and a refresh
+lands where the user's opencode reads it, but every rewrite is written into
+that file on disk until its session is deleted, and SQLite may keep deleted
+pages or WAL frames. That breaks the rule that text stays in
+`$XDG_RUNTIME_DIR`. The alternatives each break something else: a copied
+credential in an in-memory database (`OPENCODE_DB=:memory:`) can rotate the
+user's refresh token away; an AI Edit login of its own needs a persistent
+database, again on disk, or a new login every boot. Only an API key from the
+environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) with an in-memory
+database keeps both credentials and text off disk, and that is pay-per-token,
+not the subscription. ChatGPT's own login ("Sign in with ChatGPT", token
+sharing) registers a client per sign-in, separate from Codex's login.
+
+**Memory.** A waiting server is one process (the mise wrapper execs into
+it): 157 MB RSS (136 MB PSS) when fresh, about 300 MB (280 MB PSS) once a
+rewrite has loaded the provider code. That is more than claude (240 MB) and
+Codex (120 MB). Starting a server per rewrite, as the pool does now, would
+keep it at 157 MB but pay the first-rewrite cost each time.
+
+**Verdict.** Feasible as a warm backend in latency (`serve --stdio`, Fast,
+about 2.7 s, the same as Codex), and its context can be isolated more
+tightly than Codex's and checked before sending. It brings nothing Codex
+does not already give AI Edit on the same subscription, costs more memory,
+and cannot keep the text off disk with a subscription login. Not worth
+building now; it would become interesting for API-key use (any provider,
+in memory) or for models only opencode reaches.
+
+Open risks: the plugin API (`context`, `http.request`) is v2 and new, and
+the guard must fail closed if it ever stops loading; Fast is requested
+(`service_tier: priority`) and was faster, yet the response reported the
+`default` tier; the two outliers; and the token-sharing route's limits
+(`subscription_sharing_*` errors) are separate from Codex's.
+
 ### Capture and insert (measured)
 
 How the chord reaches the focused window depends on the window:

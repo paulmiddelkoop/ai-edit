@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Measure synthetic rewrites through an opencode server with reduced context.
+
+    opencode-benchmark <provider/model> [--variant low] --output results.json
+
+One `opencode serve --stdio` per run, a fresh session per rewrite, timed from
+session creation to the completed result. Configuration, plugins, skills and
+instruction files come from a temporary directory; credentials come from the
+user's own opencode database (OPENCODE_DB), so nothing is copied and a token
+refresh lands where opencode keeps it. The sessions are deleted after each
+rewrite. A plugin in the temporary configuration leaves only AI Edit's system
+prompt in the request, refuses any request with tools or other messages, and
+records what was sent.
+"""
+
+import argparse
+import base64
+import json
+import os
+import pathlib
+import secrets
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("model", help="provider/model, for example openai/gpt-6.1-sol-fast")
+p.add_argument("--variant", default="low")
+p.add_argument("--probe", action="store_true", help="One rewrite only")
+p.add_argument("--output", type=pathlib.Path, required=True)
+args = p.parse_args()
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+SYSTEM = (ROOT / "system-prompt.txt").read_text().strip()
+CONFIG = tomllib.loads((ROOT / "config.toml").read_text())
+ACTIONS = {a["key"]: a["instruction"] for a in CONFIG["action"]}
+PROVIDER, MODEL = args.model.split("/", 1)
+DATA_HOME = pathlib.Path(os.environ.get("XDG_DATA_HOME") or pathlib.Path.home() / ".local/share")
+USER_DB = DATA_HOME / "opencode" / "opencode.db"
+if not USER_DB.is_file():
+    p.error("Log in to opencode first: opencode auth login")
+if not shutil.which("opencode"):
+    p.error("opencode is not installed")
+
+TEMP = tempfile.TemporaryDirectory(prefix="ai-edit-opencode-benchmark-")
+WORK = pathlib.Path(TEMP.name)
+for name in ("config/opencode/plugins", "data", "state", "cache", "home", "cwd"):
+    (WORK / name).mkdir(parents=True)
+REPORT = WORK / "report.jsonl"
+(WORK / "system-prompt.txt").write_text(SYSTEM)
+
+# Runs inside opencode. Records sizes and shapes, not the text itself.
+PLUGIN = r"""
+import { appendFileSync, readFileSync } from "node:fs"
+import zlib from "node:zlib"
+
+const system = readFileSync(process.env.AI_EDIT_SYSTEM_FILE!, "utf8")
+const report = (entry: unknown) => appendFileSync(process.env.AI_EDIT_REPORT!, JSON.stringify(entry) + "\n")
+const text = (parts: any[]) => parts.map((part) => part.text ?? "").join("")
+
+export default {
+  id: "ai-edit.isolate",
+  setup: async (ctx: any) => {
+    await ctx.session.hook("context", (event: any) => {
+      const tools = Object.keys(event.tools)
+      const roles = event.messages.map((message: any) => message.role)
+      report({ hook: "context", sessionID: event.sessionID, agent: event.agent, tools, roles,
+        removed: event.system.slice(1).map((part: any) => text([part]).split("\n")[0].slice(0, 40)) })
+      if (event.agent !== "rewrite" || tools.length || roles.join() !== "user" || text(event.system.slice(0, 1)) !== system)
+        throw new Error("AI Edit: unexpected context")
+      event.system = event.system.slice(0, 1)
+    })
+    await ctx.session.hook("http.request", async (event: any) => {
+      let body = new Uint8Array(await event.request.clone().arrayBuffer())
+      if (event.request.headers.get("content-encoding") === "zstd") body = zlib.zstdDecompressSync(body)
+      const sent = JSON.parse(new TextDecoder().decode(body))
+      const input = (sent.input ?? []).map((item: any) => ({ type: item.type, role: item.role,
+        characters: text(item.content ?? []).length }))
+      report({ hook: "http.request", sessionID: event.sessionID, kind: event.kind,
+        url: event.request.url, keys: Object.keys(sent).sort(), tools: (sent.tools ?? []).length,
+        instructions_match: sent.instructions === system, input,
+        service_tier: sent.service_tier, reasoning: sent.reasoning, store: sent.store })
+    })
+  },
+}
+"""
+(WORK / "config/opencode/plugins/ai-edit.ts").write_text(PLUGIN)
+
+SETTINGS = {
+    "agents": {
+        "rewrite": {"mode": "primary", "system": SYSTEM,
+                    "permissions": [{"action": "*", "resource": "*", "effect": "deny"}]},
+        "title": {"disabled": True},
+    },
+    "plugins": ["-opencode.prompt.identity", "-opencode.tools", "-opencode.config.instruction"],
+    "snapshots": False,
+    "compaction": {"auto": False},
+    "share": "disabled",
+}
+PASSWORD = secrets.token_hex(16)
+ENV = dict(
+    os.environ,
+    XDG_CONFIG_HOME=str(WORK / "config"), XDG_DATA_HOME=str(WORK / "data"),
+    XDG_STATE_HOME=str(WORK / "state"), XDG_CACHE_HOME=str(WORK / "cache"),
+    HOME=str(WORK / "home"), OPENCODE_DB=str(USER_DB),
+    OPENCODE_DISABLE_PROJECT_CONFIG="1", OPENCODE_DISABLE_CLAUDE_CODE="1",
+    OPENCODE_DISABLE_AUTOUPDATE="1", OPENCODE_PASSWORD=PASSWORD,
+    OPENCODE_CONFIG_CONTENT=json.dumps(SETTINGS),
+    AI_EDIT_SYSTEM_FILE=str(WORK / "system-prompt.txt"), AI_EDIT_REPORT=str(REPORT),
+)
+AUTH = "Basic " + base64.b64encode(f"opencode:{PASSWORD}".encode()).decode()
+
+
+def memory(pid):
+    def kb(path, field):
+        for line in pathlib.Path(path).read_text().splitlines():
+            if line.startswith(field + ":"):
+                return int(line.split()[1])
+    return {"rss_mb": round(kb(f"/proc/{pid}/status", "VmRSS") / 1024, 1),
+            "pss_mb": round(kb(f"/proc/{pid}/smaps_rollup", "Pss") / 1024, 1)}
+
+
+class Server:
+    def __init__(self):
+        start = time.perf_counter()
+        self.stderr = []
+        self.p = subprocess.Popen(["opencode", "serve", "--stdio", "--port", "0"], cwd=WORK / "cwd",
+                                  env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        threading.Thread(target=lambda: self.stderr.extend(self.p.stderr.readlines()), daemon=True).start()
+        line = self.p.stdout.readline()
+        if not line:
+            self.p.wait()
+            raise RuntimeError("Server exited: " + "".join(self.stderr)[-2000:])
+        self.url = json.loads(line)["url"]
+        self.info = self.call("GET", "/api/info")
+        self.ready_seconds = time.perf_counter() - start
+
+    def call(self, method, path, body=None):
+        request = urllib.request.Request(
+            self.url + path, method=method,
+            headers={"Authorization": AUTH, "Content-Type": "application/json"},
+            data=None if body is None else json.dumps(body).encode())
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                data = response.read()
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f"{method} {path}: {error.code} {error.read().decode()[:500]}")
+        return json.loads(data) if data else None
+
+    def run(self, sample, phase):
+        action, name, text = sample
+        start = time.perf_counter()
+        session = self.call("POST", "/api/session", {
+            "agent": "rewrite", "title": "AI Edit",
+            "model": {"providerID": PROVIDER, "id": MODEL, "variant": args.variant},
+            "location": {"directory": str(WORK / "cwd")},
+        })["data"]["id"]
+        session_ready = time.perf_counter()
+        try:
+            self.call("POST", f"/api/session/{session}/prompt",
+                      {"text": ACTIONS[action] + "\n\n<text>\n" + text + "\n</text>"})
+            self.call("POST", f"/api/experimental/session/{session}/wait")
+            end = time.perf_counter()
+            messages = self.call("GET", f"/api/session/{session}/message?type=assistant&order=asc")["data"]
+        finally:
+            self.call("DELETE", f"/api/session/{session}")
+        answer = messages[-1] if messages else {}
+        row = {
+            "model": args.model, "variant": args.variant, "phase": phase, "sample": name,
+            "server_ready_s": round(self.ready_seconds, 3),
+            "session_setup_s": round(session_ready - start, 3),
+            "complete_s": round(end - start, 3),
+            "assistant_messages": len(messages),
+            "content_types": [part.get("type") for part in answer.get("content", [])],
+            "output": "".join(part.get("text", "") for part in answer.get("content", [])
+                              if part.get("type") == "text"),
+            "finish": answer.get("finish"), "error": answer.get("error"),
+            "tokens": answer.get("tokens"),
+            "actual_tier": (answer.get("providerState") or {}).get("serviceTier"),
+            "session": session,
+        }
+        print(json.dumps(row, ensure_ascii=False), flush=True)
+        return row
+
+    def close(self):
+        if self.p.poll() is None:
+            self.p.stdin.close()
+            try:
+                self.p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+                self.p.wait()
+
+
+SAMPLES = [
+    ("f", "english_short", "I has recieved your mesage and will reply tomorow."),
+    ("f", "dutch_short", "Ik heb de wijzigingen gecontrolleerd en alles werk nu goed."),
+    ("f", "very_short", "Dat gebeurd morgen."),
+    ("i", "improve", "We need to move the meeting because the report is not ready yet and we need the report for the meeting, so can we do Thursday instead?"),
+    ("e", "translate", "Kun je de bijgewerkte planning voor vrijdag doorsturen? Dan kan ik die nog met het team bespreken."),
+    ("f", "multiline", "Hi Alex,\n\nThanks for you help yesterday. The changes is ready, but I havent tested the last part yet.\n\nCan you take a look tomorow?"),
+]
+
+
+def requests_for(session):
+    entries = [json.loads(line) for line in REPORT.read_text().splitlines()] if REPORT.exists() else []
+    return [e for e in entries if e.get("sessionID") == session]
+
+
+if __name__ == "__main__":
+    rows, checks, idle_memory = [], [], None
+    server = Server()
+    try:
+        time.sleep(2)
+        idle_memory = memory(server.info["pid"])
+        for i, sample in enumerate(SAMPLES[:1] if args.probe else SAMPLES * 2):
+            row = server.run(sample, "first" if i == 0 else "warm")
+            seen = requests_for(row.pop("session"))
+            checks.append({"sample": row["sample"], "requests": seen})
+            rows.append(row)
+            if row["error"] or row["finish"] != "stop" or row["assistant_messages"] != 1:
+                raise RuntimeError("Rewrite failed: " + json.dumps(row["error"]))
+            sent = [e for e in seen if e["hook"] == "http.request"]
+            if len(sent) != 1 or sent[0]["kind"] != "primary" or sent[0]["tools"] \
+                    or not sent[0]["instructions_match"] or [i["role"] for i in sent[0]["input"]] != ["user"]:
+                raise RuntimeError("Unexpected request: " + json.dumps(seen))
+            if set(row["content_types"]) - {"text", "reasoning"}:
+                raise RuntimeError("Unexpected tool use")
+            time.sleep(1)
+        busy_memory = memory(server.info["pid"])
+    finally:
+        server.close()
+        args.output.write_text(json.dumps({
+            "opencode_version": server.info.get("version"),
+            "system_prompt": SYSTEM,
+            "actions": ACTIONS,
+            "samples": SAMPLES,
+            "settings": {**SETTINGS, "agents": {**SETTINGS["agents"], "rewrite": {
+                **SETTINGS["agents"]["rewrite"], "system": "system-prompt.txt"}}},
+            "environment": ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+                            "HOME", "OPENCODE_DB", "OPENCODE_DISABLE_PROJECT_CONFIG",
+                            "OPENCODE_DISABLE_CLAUDE_CODE", "OPENCODE_DISABLE_AUTOUPDATE"],
+            "memory_idle": idle_memory,
+            "memory_after": locals().get("busy_memory"),
+            "context_checks": checks,
+            "results": rows,
+        }, ensure_ascii=False, indent=2) + "\n")
+        TEMP.cleanup()
