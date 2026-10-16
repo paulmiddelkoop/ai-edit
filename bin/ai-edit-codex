@@ -20,6 +20,7 @@ Codex's short permissions message.
 
 import argparse
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
@@ -311,8 +312,13 @@ def main():
         system_prompt = SYSTEM_PROMPT_FILE.read_text().strip()
         WORK_DIR.mkdir(parents=True, exist_ok=True)
         codex = codex_binary()
-        model, catalog_file = prepare_home(args.model, system_prompt)
-        check_context(codex, model, catalog_file, args.fast)
+        # The pool starts a worker and its replacement at once; they share
+        # the home, so one prepares and checks while the other waits.
+        HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(HOME / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            model, catalog_file = prepare_home(args.model, system_prompt)
+            check_context(codex, model, catalog_file, args.fast)
         server = Server(command(codex, model, catalog_file, args.fast,
                                 "app-server", "--strict-config", "--listen", "stdio://"))
         deadline = time.monotonic() + 30

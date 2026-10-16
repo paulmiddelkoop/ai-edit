@@ -63,6 +63,13 @@ expect "extra context is refused" '{"error": "This Codex version would send more
   "$(FAKE_CODEX_LEAK=1 ask echo hi)"
 expect "no server after a refused check" 0 "$(jq -r 'select(.command[0] == "app-server") | 1' "$FAKE_CODEX_LOG" | wc -l)"
 
+# A worker and its replacement starting at once on an empty home.
+rm -rf "$home"
+for n in 1 2 3; do ask echo "together $n" >"$tmp/together-$n" & done
+wait
+expect "workers start together" '{"text": "TOGETHER 1"}{"text": "TOGETHER 2"}{"text": "TOGETHER 3"}' \
+  "$(cat "$tmp"/together-{1,2,3} | tr -d "\n")"
+
 # The overlay's way in: a waiting bridge whose stdin closes, or that is killed.
 "$root/bin/ai-edit-codex" gpt-test </dev/null
 expect "a bridge without a request ends" 0 "$?"
