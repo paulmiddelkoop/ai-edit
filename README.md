@@ -2,12 +2,9 @@
 
 **Your words, a little better. Right where you're typing.**
 
-Fix a typo in Slack, untangle an email in Gmail or translate a message before
-you send it. Select your text, press **Super+E** and choose an action. AI Edit
-shows what changed; **Enter** puts the result back.
-
-An [Omarchy](https://omarchy.org) plugin for the moments when you know what you
-want to say and just want a hand saying it.
+An [Omarchy](https://omarchy.org) plugin that rewrites the text you select, in
+any app: Slack, Gmail, a terminal. Press **Super+E**, choose an action and see
+what changed; **Enter** puts the result back.
 
 ![Fixing typos in a Gmail message: select the text, press Super+E and F, review the red and green changes, press Enter to paste the corrected text](docs/demo/fix.gif)
 
