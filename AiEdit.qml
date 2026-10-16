@@ -762,23 +762,58 @@ Item {
           }
         }
 
-        TextField {
-          id: promptField
+        // Drawn as the kit's TextField, but on a TextEdit: an editable
+        // TextInput reads the whole clipboard on every clipboard change to
+        // update canPaste, through Qt's Wayland reader that has no size
+        // limit or overall deadline. TextEdit only looks at the offered types.
+        BorderSurface {
+          id: promptBox
           visible: root.promptOpen
           width: parent.width
-          placeholderText: "Tell AI Edit what to do with the text"
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.title
-          Keys.priority: Keys.BeforeItem
-          Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_Escape) {
-              root.promptOpen = false
-              root.promptOnResult = false
-              keyCatcher.forceActiveFocus()
-              event.accepted = true
-            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-              root.runPrompt(promptField.text, (event.modifiers & Qt.ShiftModifier) !== 0)
-              event.accepted = true
+          height: promptField.height + topPadding + bottomPadding + borderTop + borderBottom
+          leftPadding: Style.spacing.controlPaddingX
+          rightPadding: Style.spacing.controlPaddingX
+          topPadding: Style.spacing.inputPaddingY
+          bottomPadding: Style.spacing.inputPaddingY
+          borderSpec: Border.controlSpec(promptField.activeFocus ? "focus" : "normal", Color.foreground, Color.accent)
+          color: Style.controlFill(promptField.activeFocus, false, Color.foreground, Color.accent)
+          radius: Style.cornerRadius
+
+          Text {
+            x: promptField.x
+            y: promptField.y
+            width: promptField.width
+            visible: promptField.text === "" && promptField.preeditText === ""
+            textFormat: Text.PlainText
+            text: "Tell AI Edit what to do with the text"
+            color: Qt.darker(Color.foreground, 1.6)
+            elide: Text.ElideRight
+            font: promptField.font
+          }
+
+          TextEdit {
+            id: promptField
+            x: promptBox.contentLeftInset
+            y: promptBox.contentTopInset
+            width: promptBox.width - promptBox.contentLeftInset - promptBox.contentRightInset
+            textFormat: TextEdit.PlainText
+            wrapMode: TextEdit.Wrap
+            color: Color.foreground
+            selectionColor: Style.selectionFillFor(Color.foreground, Color.accent)
+            selectedTextColor: Color.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            Keys.priority: Keys.BeforeItem
+            Keys.onPressed: function(event) {
+              if (event.key === Qt.Key_Escape) {
+                root.promptOpen = false
+                root.promptOnResult = false
+                keyCatcher.forceActiveFocus()
+                event.accepted = true
+              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                root.runPrompt(promptField.text, (event.modifiers & Qt.ShiftModifier) !== 0)
+                event.accepted = true
+              }
             }
           }
         }

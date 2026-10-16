@@ -661,6 +661,15 @@ closes only that field. The overlay sends the text it shows to `ai-edit run
 <id> --diff` on stdin, so an edit in the field is what gets rewritten; a free
 prompt runs as `ai-edit run -` with the instruction in `AI_EDIT_INSTRUCTION`.
 
+Both fields are `TextEdit`s, also the one-line prompt, which is drawn like the
+kit's `TextField`. An editable `TextInput` (what `TextField` builds on) reads
+the full clipboard text on every clipboard change to update `canPaste`, and
+since the overlay stays loaded it did so all the time, through Qt's Wayland
+reader, which has a one-second timeout per chunk but no size limit or overall
+deadline: a clipboard owner could stall or exhaust the shell. `TextEdit` only
+checks the offered types, so the clipboard is read only on an actual paste.
+(Found in the marketplace review of 0.2.0, Qt 6.11/6.12.)
+
 The diff is computed by `bin/ai-edit diff` (Python `difflib` on words with
 whitespace tokens kept) and written as `diff.json`, a list of
 `{"op": "equal|del|ins", "text": ...}` segments the QML renders.
