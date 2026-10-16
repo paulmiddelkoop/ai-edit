@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ai-edit",
   "name": "AI Edit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Paul Middelkoop",
   "repository": "https://github.com/paulmiddelkoop/ai-edit",
   "description": "Edit text with AI anywhere in Omarchy, and see what changed before it is pasted back",
