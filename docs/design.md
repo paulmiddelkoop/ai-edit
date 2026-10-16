@@ -274,9 +274,10 @@ followed.
 
 ### Codex backend (October 16, 2026)
 
-`agent = "claude" | "codex"` picks the agent. Left out, AI Edit reads
-`~/.config/omarchy/defaults/agent` (what `omarchy default agent` prints) and
-falls back to claude for an agent it does not support. Models are per agent:
+`agent = "claude" | "codex"` picks the agent. Left out, AI Edit uses claude
+when it is on the PATH and codex when only that is: Claude is about twice as
+fast (below). Following `omarchy default agent` was the first version; Paul
+chose speed over it the same day. Models are per agent:
 the default is sonnet for Claude and gpt-6.1-sol for Codex, and a Claude model
 name with Codex (or a `gpt-` name with Claude) is a config error, so a config
 written for one agent fails clearly on the other.

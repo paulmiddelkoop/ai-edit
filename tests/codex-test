@@ -80,10 +80,9 @@ kill -9 "$bridge"
 sleep 0.5
 expect "no stray processes" 0 "$(pgrep -fc "$AI_EDIT_CODEX")"
 
-# End to end through bin/ai-edit, following Omarchy's default agent.
-mkdir -p "$XDG_CONFIG_HOME/omarchy/defaults" "$XDG_CONFIG_HOME/ai-edit"
-echo codex >"$XDG_CONFIG_HOME/omarchy/defaults/agent"
-printf 'model = "gpt-test"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
+# End to end through bin/ai-edit.
+mkdir -p "$XDG_CONFIG_HOME/ai-edit"
+printf 'agent = "codex"\nmodel = "gpt-test"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
 expect "custom instruction" "HELLO THERE" "$(printf 'hello there' | AI_EDIT_INSTRUCTION=echo "$root/bin/ai-edit" run -)"
 
 ((failures == 0)) || exit 1

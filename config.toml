@@ -2,9 +2,8 @@
 # copy it to ~/.config/ai-edit/config.toml and edit the copy. Settings you
 # leave out keep these values. Actions you list replace these as a whole.
 
-# The coding agent that rewrites: claude or codex. Left out, AI Edit follows
-# the agent Omarchy is set to (omarchy default agent), or claude when that is
-# one AI Edit does not support.
+# The coding agent that rewrites: claude or codex. Left out, AI Edit uses
+# Claude Code, which is the faster, and Codex when only that is installed.
 # agent = "codex"
 # Model for actions that do not name one. Left out: sonnet for Claude (haiku
 # and opus work too), gpt-6.1-sol for Codex (any model codex lists).

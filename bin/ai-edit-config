@@ -10,6 +10,7 @@ action's model and preview resolved, or an error on stderr.
 import json
 import os
 import re
+import shutil
 import sys
 import tomllib
 from pathlib import Path
@@ -21,7 +22,6 @@ AGENTS = ("claude", "codex")
 # The model an agent uses when the config names none.
 MODELS = {"claude": "sonnet", "codex": "gpt-6.1-sol"}
 CLAUDE_MODELS = ("sonnet", "haiku", "opus")
-OMARCHY_AGENT = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy/defaults/agent"
 
 
 class ConfigError(Exception):
@@ -39,12 +39,10 @@ def load(path):
 
 
 def default_agent():
-    """The agent Omarchy is set to, when AI Edit supports it; else claude."""
-    try:
-        agent = OMARCHY_AGENT.read_text().split()[0]
-    except (OSError, IndexError):
-        return "claude"
-    return agent if agent in AGENTS else "claude"
+    """Claude when it is installed, being the faster; else Codex when that is."""
+    if not shutil.which("claude") and shutil.which("codex"):
+        return "codex"
+    return "claude"
 
 
 def check_model(where, agent, model):

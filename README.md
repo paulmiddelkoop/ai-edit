@@ -27,8 +27,8 @@ want to say and just want a hand saying it.
 ## Install
 
 You'll need **Omarchy 4.0 or newer** and **Claude Code or Codex logged in**.
-AI Edit uses the agent Omarchy is set to (`omarchy default agent`), or
-Claude Code when that is another agent; `agent` in the config overrides it.
+AI Edit uses Claude Code, which is the faster, and Codex when only that is
+installed; `agent` in the config overrides it.
 Run `claude` or `codex` once if you haven't signed in yet.
 
 Install the plugin:
@@ -120,7 +120,7 @@ open AI Edit.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `agent` | Omarchy's | The coding agent that rewrites: `claude` or `codex`. Left out, the agent Omarchy is set to, or `claude` when that is another one. |
+| `agent` | `claude` | The coding agent that rewrites: `claude` or `codex`. Left out, Claude Code, or Codex when only that is installed. |
 | `model` | per agent | Model for actions that don't name one. Claude: `sonnet` (default), `haiku` or `opus`. Codex: `gpt-6.1-sol` (default) or another model `codex` lists. |
 | `fast` | `true` | Codex only: Fast mode, about half a second quicker per rewrite, at the cost of more of your plan's usage. |
 | `preview` | `true` | Show the result before pasting it. Shift with the letter does the opposite. |

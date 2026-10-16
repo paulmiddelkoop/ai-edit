@@ -739,15 +739,19 @@ TOML
   check "a broken config is an error that says why" broken_config
   agent_choice() (
     export XDG_CONFIG_HOME=$STATE_DIR/agent
-    mkdir -p "$XDG_CONFIG_HOME/ai-edit" "$XDG_CONFIG_HOME/omarchy/defaults"
-    config | jq -e '.agent == "claude" and .model == "sonnet"' >/dev/null || exit 1
-    echo codex >"$XDG_CONFIG_HOME/omarchy/defaults/agent"
-    config | jq -e '.agent == "codex" and .model == "gpt-6.1-sol" and .fast' >/dev/null || exit 1
-    actions | jq -e 'all(.[]; .model == "gpt-6.1-sol")' >/dev/null || exit 1
-    echo opencode >"$XDG_CONFIG_HOME/omarchy/defaults/agent"
-    config | jq -e '.agent == "claude"' >/dev/null || exit 1
+    mkdir -p "$XDG_CONFIG_HOME/ai-edit" "$STATE_DIR/both" "$STATE_DIR/codex-only" "$STATE_DIR/neither"
+    for agent in claude codex; do
+      printf '#!/bin/sh\n' >"$STATE_DIR/both/$agent"
+    done
+    cp "$STATE_DIR/both/codex" "$STATE_DIR/codex-only/codex"
+    chmod +x "$STATE_DIR"/both/* "$STATE_DIR"/codex-only/*
+    found() { PATH=$STATE_DIR/$1:$(dirname "$(command -v python3)") config; }
+    found both | jq -e '.agent == "claude" and .model == "sonnet"' >/dev/null || exit 1
+    found codex-only | jq -e '.agent == "codex" and .model == "gpt-6.1-sol" and .fast' >/dev/null || exit 1
+    found neither | jq -e '.agent == "claude"' >/dev/null || exit 1
     printf 'agent = "codex"\nfast = false\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
-    config | jq -e '.agent == "codex" and (.fast | not)' >/dev/null || exit 1
+    found both | jq -e '.agent == "codex" and (.fast | not)' >/dev/null || exit 1
+    actions | jq -e 'all(.[]; .model == "gpt-6.1-sol")' >/dev/null || exit 1
     printf 'agent = "codex"\nmodel = "haiku"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
     [[ $(config 2>&1) == *"haiku is not a model for codex"* ]] || exit 1
     printf 'agent = "codex"\n[[action]]\nkey = "a"\nlabel = "A"\ninstruction = "x"\nmodel = "opus"\n' \
@@ -756,7 +760,7 @@ TOML
     printf 'agent = "pi"\n' >"$XDG_CONFIG_HOME/ai-edit/config.toml"
     [[ $(config 2>&1) == *"agent must be claude or codex"* ]]
   )
-  check "the agent follows Omarchy unless the config names one" agent_choice
+  check "Claude by default, Codex without it, unless the config names one" agent_choice
   action_ids() (
     export XDG_CONFIG_HOME=$STATE_DIR/ids
     mkdir -p "$XDG_CONFIG_HOME/ai-edit"
