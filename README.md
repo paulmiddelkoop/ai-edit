@@ -194,8 +194,6 @@ tests/codex-test
 
 - **More coding agents.** The other agents Omarchy can set up, beyond Claude
   Code and Codex.
-- **An action on its own key**, such as Super+Shift+F to fix the selection
-  without opening the list first.
 
 ## Credits & license
 
