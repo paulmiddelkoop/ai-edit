@@ -78,11 +78,13 @@ rm -rf ~/.config/ai-edit ~/.local/state/ai-edit   # your config and the agent's 
 For translations and custom instructions, the preview shows the full result
 without highlighting individual changes.
 
+![Translating a quickly typed Spanish Gmail message: select the text, press Super+E and E, read the clean English translation, press Enter to paste it over the Spanish](docs/demo/translate.gif)
+
 You can also build on a result. Shorten a message, then press **c** and type
-"make it friendlier", or press **e** to translate it. **?** shows the actions
+"use bullet points", or press **e** to translate it. **?** shows the actions
 on a result and **Backspace** takes you back one step.
 
-![Shortening a Gmail message with S, then pressing C and typing "Make it friendlier" to refine the shortened result before pasting it with Enter](docs/demo/steer.gif)
+![Shortening a wordy Gmail message with S, then pressing C and typing "Use bullet points" to turn the shortened result into a list before pasting it with Enter](docs/demo/chain.gif)
 
 **Nothing selected?** Super+E opens an empty field. Type something and press
 Tab, or paste your text, then choose an action. The result goes to your

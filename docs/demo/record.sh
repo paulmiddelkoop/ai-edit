@@ -5,16 +5,17 @@
 #
 # Before: a Gmail compose pop-out ("New Message") with an empty To field, from
 # an account that may be shown, with the cursor in its body.
-# Usage: docs/demo/record.sh <work dir> fix|steer
+# Usage: docs/demo/record.sh <work dir> fix|chain|translate
 set -u
 OUT=$(mkdir -p "${1:?work dir}" && cd "$1" && pwd)
-CLIP=${2:?clip: fix or steer}
+CLIP=${2:?clip: fix, chain or translate}
 S=$(cd "$(dirname "$0")/../.." && pwd)/bin/ai-edit
 ST=$XDG_RUNTIME_DIR/ai-edit
 USER_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/ai-edit/config.toml
 case $CLIP in
   fix) MSG="Sorry for teh late reply. Lets meet tomorow at 3 if that works for you." ;;
-  steer) MSG="I just wanted to ask if you could send me the photos from Saturday when you have a chance. It would be really nice to have a copy of them." ;;
+  chain) MSG="So basically, before the party we really still need to book the venue, which has to happen by Friday, then send out all the invitations by Monday, and then also confirm the final guest count by Wednesday." ;;
+  translate) MSG="hola alex perdona el retraso el informe estara listo el jueves pero todavia me faltan las cifras de ventas de marzo me las puedes mandar mañana" ;;
   *) echo "unknown clip $CLIP"; exit 2 ;;
 esac
 # The compose window, in logical pixels, centred over the overlay so the
@@ -145,18 +146,25 @@ case $CLIP in
     overlay || abort "overlay closed"
     mark "enter|Paste back|Enter"; key '' Return; pause 3.2
     ;;
-  steer)
-    mark "s|Shorten|S"; since=$(now); key '' s
+  chain)
+    mark "s|Cut the filler|S"; since=$(now); key '' s
     wait_result "$since" || abort "no result"
     pause 3
     overlay || abort "overlay closed"
-    mark "c|Refine the result|C"; key '' c; pause 0.5
-    type_text "Make it friendlier"; pause 0.5
+    mark "c|Make it easy to scan|C"; key '' c; pause 0.5
+    type_text "Use bullet points"; pause 0.5
     mark "enter1|Apply|Enter"; since=$(now); key '' Return
+    wait_result "$since" || abort "no result"
+    pause 3
+    overlay || abort "overlay closed"
+    mark "enter2|Paste back|Enter"; key '' Return; pause 3.2
+    ;;
+  translate)
+    mark "e|Translate to English|E"; since=$(now); key '' e
     wait_result "$since" || abort "no result"
     pause 3.5
     overlay || abort "overlay closed"
-    mark "enter2|Paste back|Enter"; key '' Return; pause 3.2
+    mark "enter|Paste back|Enter"; key '' Return; pause 3.2
     ;;
 esac
 stop=$(now)
