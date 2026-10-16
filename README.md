@@ -27,9 +27,16 @@ want to say and just want a hand saying it.
 ## Install
 
 You'll need **Omarchy 4.0 or newer** and **Claude Code or Codex logged in**.
-AI Edit uses Claude Code, which is the faster, and Codex when only that is
-installed; `agent` in the config overrides it.
 Run `claude` or `codex` once if you haven't signed in yet.
+
+| Agent | Used | Default model | Typical rewrite |
+| --- | --- | --- | --- |
+| Claude Code | by default | Sonnet (`sonnet`) | about 1.3 s |
+| Codex | when Claude Code is not installed, or with `agent = "codex"` | GPT-6.1 Sol in Fast mode (`gpt-6.1-sol`) | about 2.7 s, 3.2 s without Fast |
+
+Times are for a sentence or a short email, from choosing the action to the
+result, measured in October 2026; they vary with the provider's load. Other
+models and Fast mode are set in the [config](#make-it-yours).
 
 Install the plugin:
 
