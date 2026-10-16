@@ -1,9 +1,8 @@
 import QtQuick
 
-// Covers a TextEdit so it never reads the clipboard itself: Qt's middle-click
-// paste and drop read it inside the shell, synchronously and with no limit on
-// size or time. A middle click is handed on as primaryPaste, a drop is taken
-// and ignored.
+// Covers a TextEdit so a middle click never pastes through Qt, which reads the
+// primary selection inside the shell, synchronously and with no limit on size
+// or time; the click is handed on as primaryPaste.
 Item {
   id: root
 
@@ -15,10 +14,5 @@ Item {
     anchors.fill: parent
     acceptedButtons: Qt.MiddleButton
     onClicked: function(mouse) { root.primaryPaste(mouse.x, mouse.y) }
-  }
-
-  DropArea {
-    anchors.fill: parent
-    onDropped: function(drop) { drop.accept(Qt.IgnoreAction) }
   }
 }

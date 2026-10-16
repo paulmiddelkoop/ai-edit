@@ -122,18 +122,22 @@ wl-copy() {
 
 # A clipboard owner can stream without end or stall: every read is bounded in
 # size and time. Returns 2 when the data is larger than <max> (the file then
-# holds its first <max> bytes), 124 when the owner did not finish in time,
-# otherwise wl-paste's status.
+# holds its first <max> bytes), 124 when the owner did not finish in time, 5
+# when the file could not be written, otherwise wl-paste's status.
 read_clipboard() {
   local file="$1" max="$2" status
   shift 2
   timeout 2 wl-paste "$@" 2>/dev/null 9>&- | head -c $((max + 1)) >"$file"
-  status=${PIPESTATUS[0]}
+  status=("${PIPESTATUS[@]}")
+  if ((status[1] != 0)); then
+    : >"$file"
+    return 5
+  fi
   if (($(stat -c %s "$file") > max)); then
     truncate -s "$max" "$file"
     return 2
   fi
-  return "$status"
+  return "${status[0]}"
 }
 
 # Through files, never a variable: bash drops NUL bytes, and an image on the
@@ -678,6 +682,13 @@ selftest() {
     ! ls "$STATE_DIR"/paste.* >/dev/null 2>&1
   )
   check "paste hands over the text exactly" paste_kept
+  paste_unwritable() (
+    wl-paste() { printf 'whole'; }
+    head() { command head -c 2; return 1; }
+    out=$(paste_text 2>&1) && exit 1
+    [[ $out == *"could not be read"* ]]
+  )
+  check "a paste that could not be written is not handed over" paste_unwritable
   paste_bounded() (
     MAX_TEXT=8
     wl-paste() { yes; }

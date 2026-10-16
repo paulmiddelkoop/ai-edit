@@ -505,6 +505,7 @@ Item {
     id: clipProc
     property var request: null
     property var pending: null
+    property var pasteAfter: null
     command: [root.aiEditBin, "clip"]
     stdinEnabled: true
     onStarted: {
@@ -518,7 +519,13 @@ Item {
       if (code === 0 && cut && root.unchanged(cut)) cut.field.remove(cut.start, cut.end)
       var next = pending
       pending = null
-      if (next) root.clip(next)
+      if (next) {
+        root.clip(next)
+      } else if (pasteAfter) {
+        var paste = pasteAfter
+        pasteAfter = null
+        root.paste(paste.field, false, paste.position)
+      }
     }
   }
 
@@ -526,6 +533,11 @@ Item {
   // actions.
   function paste(field, primary, position) {
     if (pasteProc.running || field.readOnly) return
+    // A paste right after a copy has to read that copy.
+    if (!primary && clipProc.running) {
+      clipProc.pasteAfter = { field: field, position: position }
+      return
+    }
     if (position !== undefined) {
       field.forceActiveFocus()
       field.cursorPosition = position

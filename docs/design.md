@@ -668,9 +668,9 @@ since the overlay stays loaded it did so all the time, through Qt's Wayland
 reader, which has a one-second timeout per chunk but no size limit or overall
 deadline: a clipboard owner could stall or exhaust the shell. `TextEdit` only
 checks the offered types. A paste itself would go through that same reader,
-so the fields never let Qt paste: the paste keys (`StandardKey.Paste`), a
-middle click (the primary selection) and a drop are taken before the
-`TextEdit` sees them, and the text comes from `ai-edit paste`, which reads it
+so the fields never let Qt paste: the paste keys (`StandardKey.Paste`) and a
+middle click (the primary selection) are taken before the `TextEdit` sees
+them (it takes no drops), and the text comes from `ai-edit paste`, which reads it
 with `wl-paste` in its own process, at most 4 MiB and 2 s, and the shell
 inserts it when it arrives. The other direction has the same problem: Qt
 serves what the shell copies with a blocking `write()` to whoever asks, so a
