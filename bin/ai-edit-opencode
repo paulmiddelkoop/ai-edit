@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from pathlib import Path
@@ -86,7 +87,8 @@ def prepare_home():
     guard = GUARD.read_text()
     target = plugins / "ai-edit-guard.ts"
     if not target.is_file() or target.read_text() != guard:
-        temp = target.with_suffix(".tmp")
+        # Workers for several models start together.
+        temp = target.with_name(f".{target.name}.{os.getpid()}")
         temp.write_text(guard)
         temp.replace(target)
     return HOME / "config"
@@ -108,6 +110,10 @@ def environment(config_dir, system_prompt, password, status):
 def die_with_parent():
     # The server must not outlive a bridge that is killed.
     ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)
+
+
+# A proxy from the environment would get the password and the text.
+LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def last_line(lines):
@@ -155,7 +161,7 @@ class Server:
             headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"},
             data=None if body is None else json.dumps(body).encode())
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with LOCAL.open(request, timeout=timeout) as response:
                 data = response.read()
         except urllib.error.HTTPError as error:
             raise Failure(f"opencode refused {method} {path.split('?')[0]}: {error.code} {error_text(error.read())}")
@@ -209,10 +215,17 @@ def pick_model(server, name, fast):
 def clean_up(server):
     """Deletes rewrites a killed bridge left in the user's database."""
     cutoff = time.time() - TURN_TIMEOUT - 30
+    sessions, query = [], {"directory": str(WORK_DIR), "limit": "100"}
     try:
-        sessions = server.call("GET", "/api/session").get("data", [])
+        for page in range(20):
+            listed = server.call("GET", "/api/session?" + urllib.parse.urlencode(query))
+            sessions += listed.get("data") or []
+            following = (listed.get("cursor") or {}).get("next")
+            if not listed.get("data") or not following:
+                break
+            query = {"directory": str(WORK_DIR), "limit": "100", "cursor": following}
     except Failure:
-        return
+        pass
     for session in sessions:
         created = (session.get("time") or {}).get("created") or 0
         if (session.get("agent") == "rewrite" and session.get("title") == TITLE

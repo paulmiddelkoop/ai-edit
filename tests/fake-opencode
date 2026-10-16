@@ -10,11 +10,14 @@ OPENCODE_DB (a JSON file here), and FAKE_OPENCODE_LOG gets one line per start
 with the configuration and one per deleted session.
 """
 import base64
+import contextlib
+import fcntl
 import json
 import os
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -28,7 +31,14 @@ MODELS = [
     {"providerID": "openai", "id": "gpt-test-fast", "variants": [{"id": "low"}]},
     {"providerID": "local", "id": "plain", "variants": []},
 ]
-lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def locked():
+    # Several fake servers share the file, as servers share the real database.
+    with open(str(DB) + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def log(entry):
@@ -95,9 +105,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/model":
             return self.reply(200, {"data": MODELS})
         if path == "/api/session":
-            return self.reply(200, {"data": list(load().values())})
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            with locked():
+                stored = load()
+            sessions = [v for v in stored.values()
+                        if v.get("location", {}).get("directory") in query.get("directory", [None])]
+            start, limit = int(query.get("cursor", ["0"])[0]), min(int(query.get("limit", ["50"])[0]), 2)
+            page = sessions[start:start + limit]
+            following = str(start + limit) if start + limit < len(sessions) else None
+            return self.reply(200, {"data": page, "cursor": {"next": following}})
         if parts[:2] == ["api", "session"] and parts[3:] == ["message"]:
-            session = load().get(parts[2])
+            with locked():
+                session = load().get(parts[2])
             return self.reply(404 if session is None else 200, {"data": (session or {}).get("messages", [])})
         self.reply(404, {"message": "not found"})
 
@@ -106,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self.body()
         parts = self.path.split("?")[0].strip("/").split("/")
-        with lock:
+        with locked():
             sessions = load()
             if parts == ["api", "session"]:
                 session = dict(body, id=f"ses_{time.monotonic_ns()}",
@@ -135,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps({"sessionID": session["id"], "refused": refused}))
                 if refused or text == ENV.get("AI_EDIT_PROBE"):
                     return self.reply(204)
-            with lock:
+            with locked():
                 sessions = load()
                 sessions[session["id"]]["messages"] = [answer(session, text)]
                 save(sessions)
@@ -146,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         parts = self.path.strip("/").split("/")
-        with lock:
+        with locked():
             sessions = load()
             gone = sessions.pop(parts[2], None)
             save(sessions)

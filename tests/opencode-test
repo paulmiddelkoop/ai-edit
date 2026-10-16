@@ -42,6 +42,8 @@ expect "dead server" '{"error": "opencode stopped answering: Remote end closed c
   "$(ask die hi)"
 expect "timeout" '{"error": "opencode did not answer within 2 s"}' "$(ask hang hi)"
 expect "no tools" '{"error": "opencode tried to use tool"}' "$(ask tool hi)"
+expect "a proxy is not used for the local server" '{"text": "HELLO"}' \
+  "$(http_proxy=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9 no_proxy= NO_PROXY= ask echo hello)"
 expect "unknown model" '{"error": "opencode has no model openai/none; log in to its provider with: opencode auth login"}' \
   "$(AI_EDIT_TURN_TIMEOUT=10 ask echo hi false openai/none)"
 expect "provider/model" '{"error": "gpt-test is not an opencode model: write provider/model"}' \
@@ -71,11 +73,22 @@ expect "a guard that refuses stops the server's use" \
 now=$(date +%s%3N)
 jq -n --arg dir "$XDG_STATE_HOME/ai-edit/agent" --argjson now "$now" '{
   old: {id: "old", agent: "rewrite", title: "AI Edit", location: {directory: $dir}, time: {created: ($now - 600000)}},
+  old2: {id: "old2", agent: "rewrite", title: "AI Edit", location: {directory: $dir}, time: {created: ($now - 600000)}},
+  old3: {id: "old3", agent: "rewrite", title: "AI Edit", location: {directory: $dir}, time: {created: ($now - 600000)}},
+  elsewhere: {id: "elsewhere", agent: "rewrite", title: "AI Edit", location: {directory: "/x"}, time: {created: 0}},
   busy: {id: "busy", agent: "rewrite", title: "AI Edit", location: {directory: $dir}, time: {created: $now}},
   mine: {id: "mine", agent: "build", title: "AI Edit", location: {directory: $dir}, time: {created: 0}}}' >"$OPENCODE_DB"
 ask echo hi >/dev/null
-expect "left-over rewrites are cleaned up, others kept" '["busy","mine"]' "$(jq -c 'keys' "$OPENCODE_DB")"
+expect "left-over rewrites are cleaned up, on every page, others kept" '["busy","elsewhere","mine"]' \
+  "$(jq -c 'keys' "$OPENCODE_DB")"
 echo '{}' >"$OPENCODE_DB"
+
+# Workers for several models starting together on an empty home.
+rm -rf "$home"
+for n in 1 2 3; do ask echo "together $n" >"$tmp/together-$n" & done
+wait
+expect "workers start together" '{"text": "TOGETHER 1"}{"text": "TOGETHER 2"}{"text": "TOGETHER 3"}' \
+  "$(cat "$tmp"/together-{1,2,3} | tr -d "\n")"
 
 # The overlay's way in: a waiting bridge whose stdin closes, or that is killed.
 "$root/bin/ai-edit-opencode" openai/gpt-test </dev/null >/dev/null
