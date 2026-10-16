@@ -524,7 +524,7 @@ Item {
       } else if (pasteAfter) {
         var paste = pasteAfter
         pasteAfter = null
-        root.paste(paste.field, false, paste.position)
+        if (root.opened && paste.run === root.runId) root.paste(paste.field, false, paste.position)
       }
     }
   }
@@ -535,7 +535,7 @@ Item {
     if (pasteProc.running || field.readOnly) return
     // A paste right after a copy has to read that copy.
     if (!primary && clipProc.running) {
-      clipProc.pasteAfter = { field: field, position: position }
+      clipProc.pasteAfter = { field: field, position: position, run: root.runId }
       return
     }
     if (position !== undefined) {
